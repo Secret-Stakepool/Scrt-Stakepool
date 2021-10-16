@@ -1,7 +1,7 @@
 use bincode2;
 use serde::{Deserialize, Serialize};
 
-use crate::state::{CONFIG_KEY, VALIDATOR_SET_KEY};
+use crate::constants::{CONFIG_KEY, VALIDATOR_SET_KEY};
 use cosmwasm_std::{ReadonlyStorage, StdError, StdResult, Storage};
 use cosmwasm_storage::{PrefixedStorage, ReadonlyPrefixedStorage};
 use std::cmp::Ordering;

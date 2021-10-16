@@ -21,46 +21,6 @@ pub struct InitMsg {
     pub unbonding_period:u64,
 }
 
-
-
-/// This type represents optional configuration values which can be overridden.
-/// All values are optional and have defaults which are more private by default,
-/// but can be overridden if necessary
-#[derive(Serialize, Deserialize, JsonSchema, Clone, Default, Debug)]
-#[serde(rename_all = "snake_case")]
-pub struct InitConfig {
-    /// Indicates whether the total supply is public or should be kept secret.
-    /// default: False
-    pub(crate) public_total_supply: Option<bool>,
-    /// Indicates whether deposit functionality should be enabled
-    /// default: False
-    pub(crate) enable_deposit: Option<bool>,
-    /// Indicates whether redeem functionality should be enabled
-    /// default: False
-    pub(crate) enable_redeem: Option<bool>,
-
-    pub(crate) validator: String,
-}
-
-impl InitConfig {
-    pub fn public_total_supply(&self) -> bool {
-        self.public_total_supply.unwrap_or(false)
-    }
-
-    pub fn deposit_enabled(&self) -> bool {
-        self.enable_deposit.unwrap_or(false)
-    }
-
-    pub fn redeem_enabled(&self) -> bool {
-        self.enable_redeem.unwrap_or(false)
-    }
-
-
-    pub fn validator(&self) -> String {
-        self.validator.clone()
-    }
-}
-
 #[derive(Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum HandleMsg {
@@ -344,32 +304,6 @@ pub enum ResponseStatus {
     Success,
     Failure,
 }
-
-#[derive(Serialize, Deserialize, Clone, PartialEq, JsonSchema, Debug)]
-#[serde(rename_all = "snake_case")]
-pub enum ContractStatusLevel {
-    NormalRun,
-    StopAllButWithdraw,
-    StopAll,
-}
-
-pub fn status_level_to_u8(status_level: ContractStatusLevel) -> u8 {
-    match status_level {
-        ContractStatusLevel::NormalRun => 0,
-        ContractStatusLevel::StopAllButWithdraw => 1,
-        ContractStatusLevel::StopAll => 2,
-    }
-}
-
-pub fn u8_to_status_level(status_level: u8) -> StdResult<ContractStatusLevel> {
-    match status_level {
-        0 => Ok(ContractStatusLevel::NormalRun),
-        1 => Ok(ContractStatusLevel::StopAllButWithdraw),
-        2 => Ok(ContractStatusLevel::StopAll),
-        _ => Err(StdError::generic_err("Invalid state level")),
-    }
-}
-
 // Take a Vec<u8> and pad it up to a multiple of `block_size`, using spaces at the end.
 pub fn space_pad(block_size: usize, message: &mut Vec<u8>) -> &mut Vec<u8> {
     let len = message.len();
@@ -382,29 +316,4 @@ pub fn space_pad(block_size: usize, message: &mut Vec<u8>) -> &mut Vec<u8> {
     message.reserve(missing);
     message.extend(std::iter::repeat(b' ').take(missing));
     message
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use cosmwasm_std::{from_slice, StdResult};
-
-    #[derive(Serialize, Deserialize, JsonSchema, Debug, PartialEq)]
-    #[serde(rename_all = "snake_case")]
-    pub enum Something {
-        Var { padding: Option<String> },
-    }
-
-    #[test]
-    fn test_deserialization_of_missing_option_fields() -> StdResult<()> {
-        let input = b"{ \"var\": {} }";
-        let obj: Something = from_slice(input)?;
-        assert_eq!(
-            obj,
-            Something::Var { padding: None },
-            "unexpected value: {:?}",
-            obj
-        );
-        Ok(())
-    }
 }
