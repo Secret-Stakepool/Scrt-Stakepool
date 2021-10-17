@@ -1,25 +1,29 @@
+//Crate Import
+use crate::constants::*;
+use crate::msg::{HandleAnswer, HandleMsg, InitMsg, QueryAnswer, QueryMsg, ResponseStatus::Success, ResponseStatus::Failure, space_pad};
+use crate::rand::sha_256;
+use crate::staking::{stake, get_rewards, undelegate, withdraw_to_winner, redelegate};
+use crate::state::{read_viewing_key, write_viewing_key, Config, Lottery, LastLotteryResults, UserWinningHistory, LotteryEntries, UserInfo, SupplyPool};
+use crate::viewing_key::{ViewingKey, VIEWING_KEY_SIZE};
+
+//Cosmwasm import
 use cosmwasm_std::{
-    to_binary, Api, BankMsg, Binary,  Coin, CosmosMsg, Env, Extern,
+    to_binary, Api, BankMsg, Binary, Coin, CosmosMsg, Env, Extern,
     HandleResponse, HumanAddr, InitResponse, Querier, QueryResult,
-    StdError, StdResult, Storage, Uint128,
-};
+    StdError, StdResult, Storage, Uint128, };
+use cosmwasm_storage::{PrefixedStorage, ReadonlyPrefixedStorage};
+
+//secret toolkit import
+use secret_toolkit::storage::{TypedStore, TypedStoreMut, AppendStore, AppendStoreMut};
+use secret_toolkit::incubator::{GenerationalStore, GenerationalStoreMut, generational_store::Entry};
+
+//Rust functions
 use sha2::{Digest, Sha256};
 use rand::distributions::WeightedIndex;
 use rand::prelude::*;
 use rand::{SeedableRng};
 use rand_chacha::ChaChaRng;
-use crate::msg::{HandleAnswer, HandleMsg, InitMsg, QueryAnswer, QueryMsg, ResponseStatus::Success, space_pad};
-use crate::rand::sha_256;
-use crate::staking::{stake, get_rewards, undelegate, withdraw_to_winner, redelegate};
-use crate::state::{read_viewing_key, write_viewing_key, Config, Lottery, LastLotteryResults, UserWinningHistory, LotteryEntries, UserInfo, SupplyPool};
-use crate::viewing_key::{ViewingKey, VIEWING_KEY_SIZE};
-use secret_toolkit::storage::{TypedStore, TypedStoreMut, AppendStore, AppendStoreMut};
-use secret_toolkit::incubator::{GenerationalStore, GenerationalStoreMut};
-use crate::constants::*;
 use std::borrow::Borrow;
-use crate::msg::ResponseStatus::Failure;
-use cosmwasm_storage::{PrefixedStorage, ReadonlyPrefixedStorage};
-use secret_toolkit::incubator::generational_store::Entry;
 
 /// We make sure that responses from `handle` are padded to a multiple of this size.
 pub const RESPONSE_BLOCK_SIZE: usize = 256;
@@ -763,8 +767,8 @@ fn try_redelegate<S: Storage, A: Api, Q: Querier>(
 ) -> StdResult<HandleResponse> {
 
     //updating user data
-    let  user_prefixed = ReadonlyPrefixedStorage::multilevel(&[USER_INFO_KEY, env.message.sender.0.as_bytes()], & deps.storage);
-    let  user_store = TypedStore::<UserInfo, ReadonlyPrefixedStorage<'_, S>>::attach(& user_prefixed);
+    let user_prefixed = ReadonlyPrefixedStorage::multilevel(&[USER_INFO_KEY, env.message.sender.0.as_bytes()], &deps.storage);
+    let user_store = TypedStore::<UserInfo, ReadonlyPrefixedStorage<'_, S>>::attach(&user_prefixed);
     let mut user =
         user_store.load(env.message.sender.0.as_bytes())
             .unwrap_or(UserInfo { amount_delegated: Uint128(0), amount_available_for_withdraw: Uint128(0), requested_withdraw: vec![], total_won: Uint128(0), entry_index: vec![] }); // NotFound is the only possible error
@@ -818,7 +822,6 @@ fn try_redelegate<S: Storage, A: Api, Q: Querier>(
     let mut user_prefixed = PrefixedStorage::multilevel(&[USER_INFO_KEY, env.message.sender.0.as_bytes()], &mut deps.storage);
     let mut user_store = TypedStoreMut::<UserInfo, PrefixedStorage<'_, S>>::attach(&mut user_prefixed);
     user_store.store(env.message.sender.0.as_bytes(), &user)?;
-
 
     //Updating Rewards store
     supply_pool.total_tokens_staked += redelegation_amount;
@@ -1434,9 +1437,9 @@ mod tests {
         let handlemsg = HandleMsg::Deposit { padding: None };
         let _ = handle(&mut deps, env.clone(), handlemsg);
 
-        let  user_prefixed = ReadonlyPrefixedStorage::multilevel(&[USER_INFO_KEY, env.message.sender.0.as_bytes()], & deps.storage);
-        let  user_store = TypedStore::<UserInfo, ReadonlyPrefixedStorage<'_, MockStorage>>::attach(& user_prefixed);
-        let  user =
+        let user_prefixed = ReadonlyPrefixedStorage::multilevel(&[USER_INFO_KEY, env.message.sender.0.as_bytes()], &deps.storage);
+        let user_store = TypedStore::<UserInfo, ReadonlyPrefixedStorage<'_, MockStorage>>::attach(&user_prefixed);
+        let user =
             user_store.load(env.message.sender.0.as_bytes())
                 .unwrap_or(UserInfo { amount_delegated: Uint128(0), amount_available_for_withdraw: Uint128(0), requested_withdraw: vec![], total_won: Uint128(0), entry_index: vec![] }); // NotFound is the only possible error
 
@@ -1453,8 +1456,6 @@ mod tests {
             //add one more zero and it will start giving error
             amount: Uint128::try_from("10000000").unwrap(),
         }], 10, 0);
-
-
     }
 
     #[test]
@@ -1485,9 +1486,9 @@ mod tests {
         let _res = trigger_withdraw(&mut deps, mock_env("Batman", &[], 10, 0), Uint128(600000000)).unwrap();
 
         let env = mock_env("Batman", &[], 10, 0);
-        let  user_prefixed = ReadonlyPrefixedStorage::multilevel(&[USER_INFO_KEY, env.message.sender.0.as_bytes()], & deps.storage);
-        let  user_store = TypedStore::<UserInfo, ReadonlyPrefixedStorage<'_, MockStorage>>::attach(& user_prefixed);
-        let  user =
+        let user_prefixed = ReadonlyPrefixedStorage::multilevel(&[USER_INFO_KEY, env.message.sender.0.as_bytes()], &deps.storage);
+        let user_store = TypedStore::<UserInfo, ReadonlyPrefixedStorage<'_, MockStorage>>::attach(&user_prefixed);
+        let user =
             user_store.load(env.message.sender.0.as_bytes())
                 .unwrap_or(UserInfo { amount_delegated: Uint128(0), amount_available_for_withdraw: Uint128(0), requested_withdraw: vec![], total_won: Uint128(0), entry_index: vec![] }); // NotFound is the only possible error
 
@@ -1541,9 +1542,9 @@ mod tests {
         let env = mock_env("Batman", &[], 10, config.unbonding_time);
         let _response = try_withdraw(&mut deps, env.clone(), Uint128(600000000));
 
-        let  user_prefixed = ReadonlyPrefixedStorage::multilevel(&[USER_INFO_KEY, env.message.sender.0.as_bytes()], & deps.storage);
-        let  user_store = TypedStore::<UserInfo, ReadonlyPrefixedStorage<'_, MockStorage>>::attach(& user_prefixed);
-        let  user =
+        let user_prefixed = ReadonlyPrefixedStorage::multilevel(&[USER_INFO_KEY, env.message.sender.0.as_bytes()], &deps.storage);
+        let user_store = TypedStore::<UserInfo, ReadonlyPrefixedStorage<'_, MockStorage>>::attach(&user_prefixed);
+        let user =
             user_store.load(env.message.sender.0.as_bytes())
                 .unwrap_or(UserInfo { amount_delegated: Uint128(0), amount_available_for_withdraw: Uint128(0), requested_withdraw: vec![], total_won: Uint128(0), entry_index: vec![] }); // NotFound is the only possible error
 
@@ -1568,9 +1569,9 @@ mod tests {
         let env = mock_env("Batman", &[], 10, config.unbonding_time);
         let _response = try_redelegate(&mut deps, env.clone(), Uint128(600000000));
 
-        let  user_prefixed = ReadonlyPrefixedStorage::multilevel(&[USER_INFO_KEY, env.message.sender.0.as_bytes()], & deps.storage);
-        let  user_store = TypedStore::<UserInfo, ReadonlyPrefixedStorage<'_, MockStorage>>::attach(& user_prefixed);
-        let  user =
+        let user_prefixed = ReadonlyPrefixedStorage::multilevel(&[USER_INFO_KEY, env.message.sender.0.as_bytes()], &deps.storage);
+        let user_store = TypedStore::<UserInfo, ReadonlyPrefixedStorage<'_, MockStorage>>::attach(&user_prefixed);
+        let user =
             user_store.load(env.message.sender.0.as_bytes())
                 .unwrap_or(UserInfo { amount_delegated: Uint128(0), amount_available_for_withdraw: Uint128(0), requested_withdraw: vec![], total_won: Uint128(0), entry_index: vec![] }); // NotFound is the only possible error
 
@@ -1604,9 +1605,9 @@ mod tests {
         let config: Config = configstore.load(CONFIG_KEY).unwrap();
         let _response = claim_rewards(&mut deps, mock_env("triggerer", &[], 10, config.unbonding_time)).unwrap();
 
-        let  user_prefixed = ReadonlyPrefixedStorage::multilevel(&[USER_INFO_KEY, "Batman".as_bytes()], & deps.storage);
-        let  user_store = TypedStore::<UserInfo, ReadonlyPrefixedStorage<'_, MockStorage>>::attach(& user_prefixed);
-        let  user =
+        let user_prefixed = ReadonlyPrefixedStorage::multilevel(&[USER_INFO_KEY, "Batman".as_bytes()], &deps.storage);
+        let user_store = TypedStore::<UserInfo, ReadonlyPrefixedStorage<'_, MockStorage>>::attach(&user_prefixed);
+        let user =
             user_store.load("Batman".as_bytes())
                 .unwrap_or(UserInfo { amount_delegated: Uint128(0), amount_available_for_withdraw: Uint128(0), requested_withdraw: vec![], total_won: Uint128(0), entry_index: vec![] }); // NotFound is the only possible error
 
@@ -1748,22 +1749,21 @@ mod tests {
         let lottery_store = TypedStore::<Lottery, ReadonlyPrefixedStorage<'_, MockStorage>>::attach(&mut lottery_prefixed);
         let lottery = lottery_store.load(LOTTERY_KEY).unwrap();
 
-
         let _env = mock_env("triggerer", &[Coin { denom: "uscrt".to_string(), amount: Uint128(600000000) }], 10, lottery.end_time);
         let lottery = lottery_store.load(LOTTERY_KEY).unwrap();
-        let _env = mock_env("triggerer", &[Coin { denom: "uscrt".to_string(), amount: Uint128(600000000) }], 10,lottery.end_time *2);
+        let _env = mock_env("triggerer", &[Coin { denom: "uscrt".to_string(), amount: Uint128(600000000) }], 10, lottery.end_time * 2);
         let lottery = lottery_store.load(LOTTERY_KEY).unwrap();
-        let _env = mock_env("triggerer", &[Coin { denom: "uscrt".to_string(), amount: Uint128(600000000) }], 10, lottery.end_time*3);
+        let _env = mock_env("triggerer", &[Coin { denom: "uscrt".to_string(), amount: Uint128(600000000) }], 10, lottery.end_time * 3);
         let lottery = lottery_store.load(LOTTERY_KEY).unwrap();
-        let _env = mock_env("triggerer", &[Coin { denom: "uscrt".to_string(), amount: Uint128(600000000) }], 10, lottery.end_time*4);
+        let _env = mock_env("triggerer", &[Coin { denom: "uscrt".to_string(), amount: Uint128(600000000) }], 10, lottery.end_time * 4);
         let lottery = lottery_store.load(LOTTERY_KEY).unwrap();
-        let _env = mock_env("triggerer", &[Coin { denom: "uscrt".to_string(), amount: Uint128(600000000) }], 10, lottery.end_time*5);
+        let _env = mock_env("triggerer", &[Coin { denom: "uscrt".to_string(), amount: Uint128(600000000) }], 10, lottery.end_time * 5);
         let lottery = lottery_store.load(LOTTERY_KEY).unwrap();
-        let _env = mock_env("triggerer", &[Coin { denom: "uscrt".to_string(), amount: Uint128(600000000) }], 10, lottery.end_time*6);
+        let _env = mock_env("triggerer", &[Coin { denom: "uscrt".to_string(), amount: Uint128(600000000) }], 10, lottery.end_time * 6);
         let lottery = lottery_store.load(LOTTERY_KEY).unwrap();
-        let _env = mock_env("triggerer", &[Coin { denom: "uscrt".to_string(), amount: Uint128(600000000) }], 10, lottery.end_time*7);
+        let _env = mock_env("triggerer", &[Coin { denom: "uscrt".to_string(), amount: Uint128(600000000) }], 10, lottery.end_time * 7);
         let lottery = lottery_store.load(LOTTERY_KEY).unwrap();
-        let env = mock_env("triggerer", &[Coin { denom: "uscrt".to_string(), amount: Uint128(600000000) }], 10, lottery.end_time*8);
+        let env = mock_env("triggerer", &[Coin { denom: "uscrt".to_string(), amount: Uint128(600000000) }], 10, lottery.end_time * 8);
         let _res = claim_rewards(&mut deps, env);
 
         let _res: QueryAnswer = from_binary(&query_past_records(&deps).unwrap()).unwrap();
@@ -1985,7 +1985,6 @@ mod tests {
         let _ = try_deposit(&mut deps, mock_env("Batman", &[Coin { denom: "uscrt".to_string(), amount: Uint128(600000000) }], 10, 0));
         let _ = try_deposit(&mut deps, mock_env("Batman", &[Coin { denom: "uscrt".to_string(), amount: Uint128(400000000) }], 10, 300));
 
-
         //Computing weights for the lottery
 
         let mut config_prefixed = PrefixedStorage::multilevel(&[CONFIG_KEY_PREFIX], &mut deps.storage);
@@ -2005,12 +2004,12 @@ mod tests {
         let config: Config = configstore.load(CONFIG_KEY).unwrap();
         let _response = claim_rewards(&mut deps, mock_env("triggerer", &[], 10, config.unbonding_time)).unwrap();
 
-        let  user_prefixed = ReadonlyPrefixedStorage::multilevel(&[USER_INFO_KEY, "Batman".as_bytes()], & deps.storage);
-        let  user_store = TypedStore::<UserInfo, ReadonlyPrefixedStorage<'_, MockStorage>>::attach(& user_prefixed);
-        let  user =
+        let user_prefixed = ReadonlyPrefixedStorage::multilevel(&[USER_INFO_KEY, "Batman".as_bytes()], &deps.storage);
+        let user_store = TypedStore::<UserInfo, ReadonlyPrefixedStorage<'_, MockStorage>>::attach(&user_prefixed);
+        let user =
             user_store.load("Batman".as_bytes())
                 .unwrap_or(UserInfo { amount_delegated: Uint128(0), amount_available_for_withdraw: Uint128(0), requested_withdraw: vec![], total_won: Uint128(0), entry_index: vec![] }); // NotFound is the only possible error
-    assert_eq!(user.requested_withdraw.len(), 0);
+        assert_eq!(user.requested_withdraw.len(), 0);
         assert_eq!(user.amount_delegated.0, 1000000000);
     }
 
@@ -2050,6 +2049,5 @@ mod tests {
         let lottery_store = TypedStore::<Lottery, ReadonlyPrefixedStorage<'_, MockStorage>>::attach(&mut lottery_prefixed);
         let a_lottery = lottery_store.load(LOTTERY_KEY).unwrap();
         assert_eq!(a_lottery.duration, 100);
-
     }
 }

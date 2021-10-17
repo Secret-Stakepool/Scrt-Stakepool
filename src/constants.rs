@@ -17,4 +17,3 @@ pub const USER_WINNING_HISTORY_KEY: &[u8] = b"user_winning_history";
 pub const PREFIX_VIEW_KEY: &[u8] = b"viewingkey";
 pub const VALIDATOR_SET_KEY: &[u8] = b"validator_set";
 
-
