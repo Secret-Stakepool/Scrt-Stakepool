@@ -1,7 +1,7 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use cosmwasm_std::{Binary, HumanAddr, StdError, StdResult, Uint128};
+use cosmwasm_std::{Binary, HumanAddr, Uint128};
 
 use crate::viewing_key::ViewingKey;
 
@@ -230,6 +230,10 @@ pub enum QueryMsg {
         address:HumanAddr,
         key:String
     },
+    UserAllPastRecords {
+        address:HumanAddr,
+        key:String
+    },
 
 
 
@@ -275,19 +279,20 @@ pub enum QueryAnswer {
     },
 
     PastRecords {
-         past_number_of_entries: Vec<u64>,
-         past_total_deposits:Vec<u64>,
-         past_total_rewards:Vec<(u64, u64)>
+         past_rewards:Vec<(u64, u64)>
     },
 
-    UserPastRecords {
-         winning_history:Vec<(u64,u64)>,
-    },
 
     PastAllRecords {
-        past_number_of_entries: Vec<u64>,
-        past_total_deposits:Vec<u64>,
         past_rewards:Vec<(u64,u64)>
+    },
+
+
+    UserPastRecords {
+        winning_history:Vec<(u64,u64)>,
+    },
+    UserAllPastRecords {
+        winning_history:Vec<(u64,u64)>,
     },
 
 

@@ -1,23 +1,15 @@
 use cosmwasm_std::{
-     CanonicalAddr,  HumanAddr, ReadonlyStorage, StdError, StdResult, Storage, Uint128,
+     CanonicalAddr,  HumanAddr, ReadonlyStorage, Storage, Uint128,
 };
-use cosmwasm_storage::{singleton, singleton_read, PrefixedStorage,
-    ReadonlyPrefixedStorage, ReadonlySingleton, Singleton,
+use cosmwasm_storage::{PrefixedStorage,
+    ReadonlyPrefixedStorage,
 };
 // use rust_decimal::Decimal;
-use std::any::type_name;
-use std::convert::TryFrom;
 use crate::constants::*;
-
-
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-
-use crate::utils::{bytes_to_u128, bytes_to_u32};
 use crate::viewing_key::ViewingKey;
-use serde::de::DeserializeOwned;
-
-
+use secret_toolkit::incubator::generational_store::Index;
 
 // Config
 #[derive(Serialize, Debug, Deserialize, Clone, PartialEq, JsonSchema)]
@@ -36,31 +28,53 @@ pub struct Config {
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
 pub struct Lottery {
-    pub entries: Vec<(CanonicalAddr, Uint128,u64)>,
     pub entropy: Vec<u8>,
     pub seed: Vec<u8>,
     pub duration: u64,
     pub start_time: u64,
     pub end_time: u64,
 }
+//Testing
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
+pub struct LotteryEntries{
+    pub user_address: HumanAddr,
+    pub amount:Uint128,
+    pub entry_time:u64,
+}
 
 
+//Append store
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
 pub struct LastLotteryResults {
-    pub past_winners:Vec<String>,
-    pub past_number_of_entries: Vec<u64>,
-    pub past_total_deposits:Vec<u64>,
-    //rewards and timestamp
-    pub past_total_rewards:Vec<(u64, u64)>
-}
-pub fn last_lottery_results<S: Storage>(storage: &mut S) -> Singleton<S, LastLotteryResults> {
-    singleton(storage, LAST_LOTTERY_KEY)
+    //winning amount and time
+    pub winning_amount:u64, //Append store
+    pub time:u64,
 }
 
-pub fn last_lottery_results_read<S: Storage>(storage: &S) -> ReadonlySingleton<S, LastLotteryResults> {
-    singleton_read(storage, LAST_LOTTERY_KEY)
+#[derive(Serialize, Deserialize, Eq, PartialEq, Debug, Clone)]
+pub struct SupplyPool {
+    pub total_tokens_staked: Uint128,
+    pub total_rewards_returned:Uint128,
+    pub triggerer_share:Uint128
 }
 
+#[derive(Serialize, Deserialize, Eq, PartialEq, Debug, Clone)]
+pub struct UserInfo {
+    pub amount_delegated: Uint128,
+    pub(crate) amount_available_for_withdraw:Uint128,
+    //Amount and the time of request
+    pub requested_withdraw:Vec<(Uint128,u64)>,
+    pub total_won:Uint128,
+    pub entry_index:Vec<Index>,
+
+}
+
+#[derive(Serialize, Deserialize, Eq, PartialEq, Debug, Clone)]
+pub struct UserWinningHistory{
+    //winning amount and rewards
+    pub winning_amount:u64, //Append store
+    pub time:u64,
+}
 
 // Viewing Keys
 

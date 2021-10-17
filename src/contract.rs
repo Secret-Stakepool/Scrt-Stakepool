@@ -1,5 +1,5 @@
 use cosmwasm_std::{
-    to_binary, Api, BankMsg, Binary, CanonicalAddr, Coin, CosmosMsg, Env, Extern,
+    to_binary, Api, BankMsg, Binary,  Coin, CosmosMsg, Env, Extern,
     HandleResponse, HumanAddr, InitResponse, Querier, QueryResult,
     StdError, StdResult, Storage, Uint128,
 };
@@ -11,16 +11,15 @@ use rand_chacha::ChaChaRng;
 use crate::msg::{HandleAnswer, HandleMsg, InitMsg, QueryAnswer, QueryMsg, ResponseStatus::Success, space_pad};
 use crate::rand::sha_256;
 use crate::staking::{stake, get_rewards, undelegate, withdraw_to_winner, redelegate};
-use crate::state::{ read_viewing_key, write_viewing_key, Config,  Lottery,  last_lottery_results, LastLotteryResults, last_lottery_results_read};
-use crate::validator_set::{get_validator_set, set_validator_set, ValidatorSet};
+use crate::state::{read_viewing_key, write_viewing_key, Config, Lottery, LastLotteryResults, UserWinningHistory, LotteryEntries, UserInfo, SupplyPool};
 use crate::viewing_key::{ViewingKey, VIEWING_KEY_SIZE};
 use secret_toolkit::storage::{TypedStore, TypedStoreMut, AppendStore, AppendStoreMut};
 use secret_toolkit::incubator::{GenerationalStore, GenerationalStoreMut};
-use crate::types::{UserInfo, SupplyPool};
 use crate::constants::*;
 use std::borrow::Borrow;
 use crate::msg::ResponseStatus::Failure;
 use cosmwasm_storage::{PrefixedStorage, ReadonlyPrefixedStorage};
+use secret_toolkit::incubator::generational_store::Entry;
 
 /// We make sure that responses from `handle` are padded to a multiple of this size.
 pub const RESPONSE_BLOCK_SIZE: usize = 256;
@@ -69,16 +68,14 @@ pub fn init<S: Storage, A: Api, Q: Querier>(
     let mut lottery_store = TypedStoreMut::<Lottery, PrefixedStorage<'_, S>>::attach(&mut lottery_prefixed);
     lottery_store.store(
         LOTTERY_KEY,
-        &Lottery{
-            entries: Vec::default(),
+        &Lottery {
             entropy: prng_seed_hashed.to_vec(),
-            start_time: env.block.time + 10,
-            end_time: env.block.time + duration + 10,
+            start_time: env.block.time + 0,
+            end_time: env.block.time + duration + 0,
             seed: prng_seed_hashed.to_vec(),
             duration,
-        }
+        },
     )?;
-
 
     // Setting Total supply
     let mut supply_pool_prefixed = PrefixedStorage::multilevel(&[SUPPLY_POOL_KEY_PREFIX], &mut deps.storage);
@@ -105,30 +102,28 @@ pub fn handle<S: Storage, A: Api, Q: Querier>(
     let config: Config = configstore.load(CONFIG_KEY)?;
 
     if config.is_stopped {
+        let response = match msg {
+            HandleMsg::SetNormalStatus {} => set_normal_status(deps, env),
+            HandleMsg::SetStopAllButWithdrawStatus {} => set_stop_all_but_withdraw_status(deps, env),
+            HandleMsg::SetStopAllStatus {} => set_stop_all_status(deps, env),
 
-            let response = match msg {
-                HandleMsg::SetNormalStatus {} => set_normal_status(deps, env),
-                HandleMsg::SetStopAllButWithdrawStatus {} => set_stop_all_but_withdraw_status(deps, env),
-                HandleMsg::SetStopAllStatus {} => set_stop_all_status(deps, env),
+            HandleMsg::Withdraw { amount, .. }
+            if config.is_stopped_can_withdraw =>
+                {
+                    try_withdraw(deps, env, amount)
+                }
+            HandleMsg::TriggerWithdraw { amount, .. }
+            if config.is_stopped_can_withdraw =>
+                {
+                    trigger_withdraw(deps, env, amount)
+                }
 
-                HandleMsg::Withdraw { amount, .. }
-                if config.is_stopped_can_withdraw =>
-                    {
-                        try_withdraw(deps, env, amount)
-                    }
-                HandleMsg::TriggerWithdraw { amount, .. }
-                if config.is_stopped_can_withdraw =>
-                    {
-                        trigger_withdraw(deps, env, amount)
-                    }
-
-                _ => Err(StdError::generic_err(
-                    "This contract is stopped and this action is not allowed",
-                )),
-            };
-            return pad_response(response);
-        }
-
+            _ => Err(StdError::generic_err(
+                "This contract is stopped and this action is not allowed",
+            )),
+        };
+        return pad_response(response);
+    }
 
     let response = match msg {
 
@@ -179,8 +174,8 @@ pub fn query<S: Storage, A: Api, Q: Querier>
         }
         QueryMsg::CurrentRewards {} => query_current_rewards(&deps),
         QueryMsg::TotalDeposits {} => query_total_deposit(&deps),
-        QueryMsg::PastRecords {} => query_past_results(&deps),
-        QueryMsg::PastAllRecords {} => query_all_past_results(&deps),
+        QueryMsg::PastRecords {} => query_past_records(&deps),
+        QueryMsg::PastAllRecords {} => query_all_past_records(&deps),
 
         _ => authenticated_queries(deps, msg),
     }
@@ -234,9 +229,9 @@ fn set_normal_status<S: Storage, A: Api, Q: Querier>(
     let mut config: Config = configstore.load(CONFIG_KEY)?;
 
     check_if_admin(&config, &env.message.sender)?;
-    config.is_stopped_can_withdraw=false;
-    config.is_stopped=false;
-    configstore.store(CONFIG_KEY,&config);
+    config.is_stopped_can_withdraw = false;
+    config.is_stopped = false;
+    let _ = configstore.store(CONFIG_KEY, &config);
 
     Ok(HandleResponse {
         messages: vec![],
@@ -255,9 +250,9 @@ fn set_stop_all_status<S: Storage, A: Api, Q: Querier>(
     let mut configstore = TypedStoreMut::<Config, PrefixedStorage<'_, S>>::attach(&mut config_prefixed);
     let mut config: Config = configstore.load(CONFIG_KEY)?;
     check_if_admin(&config, &env.message.sender)?;
-    config.is_stopped_can_withdraw=false;
-    config.is_stopped=true;
-    configstore.store(CONFIG_KEY,&config);
+    config.is_stopped_can_withdraw = false;
+    config.is_stopped = true;
+    let _ = configstore.store(CONFIG_KEY, &config);
     Ok(HandleResponse {
         messages: vec![],
         log: vec![],
@@ -276,9 +271,9 @@ fn set_stop_all_but_withdraw_status<S: Storage, A: Api, Q: Querier>(
     let mut config: Config = configstore.load(CONFIG_KEY)?;
 
     check_if_admin(&config, &env.message.sender)?;
-    config.is_stopped_can_withdraw=true;
-    config.is_stopped=true;
-    configstore.store(CONFIG_KEY,&config);
+    config.is_stopped_can_withdraw = true;
+    config.is_stopped = true;
+    let _ = configstore.store(CONFIG_KEY, &config);
     Ok(HandleResponse {
         messages: vec![],
         log: vec![],
@@ -296,11 +291,6 @@ fn try_deposit<S: Storage, A: Api, Q: Querier>(
     deps: &mut Extern<S, A, Q>,
     env: Env,
 ) -> StdResult<HandleResponse> {
-    // let mut config = Config::from_storage(&mut deps.storage);
-    // let constants = config.constants()?;
-
-
-
     let mut deposit_amount = Uint128::zero();
     for coin in &env.message.sent_funds {
         if coin.denom == "uscrt" {
@@ -317,35 +307,31 @@ fn try_deposit<S: Storage, A: Api, Q: Querier>(
         ));
     }
 
-    //updating user data
-    let mut userstore = TypedStoreMut::<UserInfo, S>::attach(&mut deps.storage);
+    // Updating user data
+    let mut user_prefixed = PrefixedStorage::multilevel(&[USER_INFO_KEY, env.message.sender.0.as_bytes()], &mut deps.storage);
+    let mut user_store = TypedStoreMut::<UserInfo, PrefixedStorage<'_, S>>::attach(&mut user_prefixed);
     let mut user =
-        userstore.load(env.message.sender.0.as_bytes())
-            .unwrap_or(UserInfo { amount_delegated: Uint128(0), amount_available_for_withdraw: Uint128(0), requested_withdraw: vec![], winning_history: vec![], total_won: Uint128(0) }); // NotFound is the only possible error
+        user_store.load(env.message.sender.0.as_bytes())
+            .unwrap_or(UserInfo { amount_delegated: Uint128(0), amount_available_for_withdraw: Uint128(0), requested_withdraw: vec![], total_won: Uint128(0), entry_index: vec![] }); // NotFound is the only possible error
 
     let account_balance_state = user.amount_delegated.0;
     if let Some(final_account_balance) = account_balance_state.checked_add(deposit_amount.0) {
         user.amount_delegated = Uint128(final_account_balance);
-        userstore.store(env.message.sender.0.as_bytes(), &user)?;
+        user_store.store(env.message.sender.0.as_bytes(), &user)?;
     } else {
         return Err(StdError::generic_err(
             "This deposit would overflow your balance",
         ));
     }
 
-    // update lottery entries
-    let sender_address = deps.api.canonical_address(&env.message.sender)?;
-    let mut lottery_prefixed = PrefixedStorage::multilevel(&[LOTTERY_KEY_PREFIX], &mut deps.storage);
-    let mut lottery_store = TypedStoreMut::<Lottery, PrefixedStorage<'_, S>>::attach(&mut lottery_prefixed);
-    let mut a_lottery: Lottery = lottery_store.load(LOTTERY_KEY)?;
-    &a_lottery.entries.push((
-        sender_address,
-        deposit_amount,
-        env.block.time,
-    ));
-    &a_lottery.entropy.extend(&env.block.height.to_be_bytes());
-    &a_lottery.entropy.extend(&env.block.time.to_be_bytes());
-    lottery_store.store(LOTTERY_KEY,&a_lottery)?;
+    // Update lottery entries
+    let mut lottery_entries = PrefixedStorage::multilevel(&[LOTTERY_ENTRY_KEY], &mut deps.storage);
+    let mut lottery_entries_append = GenerationalStoreMut::<LotteryEntries, PrefixedStorage<S>>::attach_or_create(&mut lottery_entries)?;
+    user.entry_index.push(lottery_entries_append.insert(LotteryEntries {
+        user_address: env.message.sender,
+        amount: deposit_amount,
+        entry_time: env.block.time,
+    }));
 
     //Updating Supply Store
     let mut supply_pool_prefixed = PrefixedStorage::multilevel(&[SUPPLY_POOL_KEY_PREFIX], &mut deps.storage);
@@ -360,8 +346,9 @@ fn try_deposit<S: Storage, A: Api, Q: Querier>(
     supply_store.store(SUPPLY_POOL_KEY, &supply_pool)?;
 
     let mut config_prefixed = PrefixedStorage::multilevel(&[CONFIG_KEY_PREFIX], &mut deps.storage);
-    let mut configstore = TypedStoreMut::<Config, PrefixedStorage<'_, S>>::attach(&mut config_prefixed);
-    let mut config: Config = configstore.load(CONFIG_KEY)?;    let mut messages: Vec<CosmosMsg> = vec![];
+    let configstore = TypedStoreMut::<Config, PrefixedStorage<'_, S>>::attach(&mut config_prefixed);
+    let config: Config = configstore.load(CONFIG_KEY)?;
+    let mut messages: Vec<CosmosMsg> = vec![];
     let validator = config.validator;
     messages.push(stake(&validator, deposit_amount.0));
 
@@ -382,8 +369,6 @@ fn claim_rewards<S: Storage, A: Api, Q: Querier>(
     let config_prefixed = ReadonlyPrefixedStorage::multilevel(&[CONFIG_KEY_PREFIX], &deps.storage);
     let configstore = TypedStore::<Config, ReadonlyPrefixedStorage<'_, S>>::attach(&config_prefixed);
     let config: Config = configstore.load(CONFIG_KEY)?;
-
-
     check_if_triggerer(&config, &env.message.sender)?;
 
     let mut lottery_prefixed = PrefixedStorage::multilevel(&[LOTTERY_KEY_PREFIX], &mut deps.storage);
@@ -392,46 +377,68 @@ fn claim_rewards<S: Storage, A: Api, Q: Querier>(
     validate_end_time(a_lottery.end_time, env.block.time)?;
     validate_start_time(a_lottery.start_time, env.block.time)?;
 
-    if a_lottery.entries.len() == 0 {
-        a_lottery.entropy.extend(&env.block.height.to_be_bytes());
-        a_lottery.entropy.extend(&env.block.time.to_be_bytes());
+    // This way every time we call the claim_rewards function we will get a different result.
+    // Plus it's going to be pretty hard to predict the exact time of the block, so less chance of cheating
+    a_lottery.entropy.extend(&env.block.height.to_be_bytes());
+    a_lottery.entropy.extend(&env.block.time.to_be_bytes());
+    a_lottery.start_time = &env.block.time + 0;
+    a_lottery.end_time = &env.block.time + a_lottery.duration + 0;
+    lottery_store.store(LOTTERY_KEY, &a_lottery)?;
 
-        a_lottery.start_time = &env.block.time + 10;
-        a_lottery.end_time = &env.block.time + a_lottery.duration + 10;
-        lottery_store.store(LOTTERY_KEY,&a_lottery)?;
-
+    //Computing weights for the lottery
+    let lottery_entries_append: GenerationalStore::<LotteryEntries, ReadonlyPrefixedStorage<S>>;
+    let lottery_entries = ReadonlyPrefixedStorage::multilevel(&[LOTTERY_ENTRY_KEY], &deps.storage);
+    if let Ok(res) = GenerationalStore::<LotteryEntries, ReadonlyPrefixedStorage<S>>::attach(&lottery_entries).unwrap_or(
+        Err(StdError::generic_err("Lottery Restarted. Error due to no entries "))
+    ) {
+        lottery_entries_append = res;
+    } else {
         return Ok(HandleResponse {
             messages: vec![],
             log: vec![],
             data: Some(to_binary(&HandleAnswer::ClaimRewards {
                 status: Failure,
-                winner: HumanAddr("No entries".to_string()),
+                winner: HumanAddr("Lottery Restarted. Error due to no entries ".to_string()),
+            })?),
+        });
+    }
+    let data = lottery_entries_append;
+    if data.iter().count() == 0 {
+        return Ok(HandleResponse {
+            messages: vec![],
+            log: vec![],
+            data: Some(to_binary(&HandleAnswer::ClaimRewards {
+                status: Failure,
+                winner: HumanAddr("Lottery Restarted. Error due to no entries ".to_string()),
             })?),
         });
     }
 
-    //Computing weights for the lottery
-    let lottery_entries: Vec<_> = (&a_lottery.entries).into_iter().map(|(address, _, _)| address).collect();
-    let weights: Vec<u128> = (&a_lottery.entries).into_iter().map(|(_, user_staked_amount, deposit_time)|
-        if &a_lottery.end_time <= deposit_time {
-            (0 as u128)
-        } else if ((&a_lottery.end_time - deposit_time) / &a_lottery.duration) >= 1 {
-            user_staked_amount.0
+    //Choosing Winner
+    let mut entries: Vec<HumanAddr> = vec![];
+    let mut weights: Vec<u128> = vec![];
+    let iterator = data.iter().filter(|item| matches!(item, (_, Entry::Occupied { .. })));
+    for user_address in iterator {
+        let user_address = match user_address.1 {
+            Entry::Occupied { generation: _, value } => value,
+            _ => panic!("Unexpected result "),
+        };
+        if a_lottery.end_time <= user_address.entry_time {
+            entries.push(user_address.user_address);
+            weights.push(0 as u128)
+        } else if ((&a_lottery.end_time - user_address.entry_time) / &a_lottery.duration) >= 1 {
+            entries.push(user_address.user_address);
+            weights.push(user_address.amount.0)
         } else {
-            (user_staked_amount.0 / 1000000) * ((((a_lottery.end_time - deposit_time) * 1000000) / a_lottery.duration) as u128)
+            entries.push(user_address.user_address);
+            weights.push((user_address.amount.0 / 1000000) * ((((a_lottery.end_time - user_address.entry_time) * 1000000) / a_lottery.duration) as u128))
         }
-    ).collect();
-
-    //extending entropy
-    a_lottery.entropy.extend(&env.block.height.to_be_bytes());
-    a_lottery.entropy.extend(&env.block.time.to_be_bytes());
-
+    }
     //Finding the winner
 
-
     let mut config_prefixed = PrefixedStorage::multilevel(&[CONFIG_KEY_PREFIX], &mut deps.storage);
-    let mut configstore = TypedStoreMut::<Config, PrefixedStorage<'_, S>>::attach(&mut config_prefixed);
-    let mut config: Config = configstore.load(CONFIG_KEY)?;
+    let configstore = TypedStoreMut::<Config, PrefixedStorage<'_, S>>::attach(&mut config_prefixed);
+    let config: Config = configstore.load(CONFIG_KEY)?;
 
     let prng_seed = config.prng_seed;
     let mut hasher = Sha256::new();
@@ -450,7 +457,7 @@ fn claim_rewards<S: Storage, A: Api, Q: Querier>(
         a_lottery.end_time = &env.block.time + a_lottery.duration + 10;
         let mut lottery_prefixed = PrefixedStorage::multilevel(&[LOTTERY_KEY_PREFIX], &mut deps.storage);
         let mut lottery_store = TypedStoreMut::<Lottery, PrefixedStorage<'_, S>>::attach(&mut lottery_prefixed);
-        lottery_store.store(LOTTERY_KEY,&a_lottery)?;
+        lottery_store.store(LOTTERY_KEY, &a_lottery)?;
 
         return Ok(HandleResponse {
             messages: vec![],
@@ -464,32 +471,36 @@ fn claim_rewards<S: Storage, A: Api, Q: Querier>(
 
     let dist = WeightedIndex::new(&weights).unwrap();
     let sample = dist.sample(&mut rng);
-    let winner = lottery_entries[sample];
+    let winner_human = entries[sample].clone();
 
     // restart the lottery after completion of this lottery
     a_lottery.start_time = &env.block.time + 10;
     a_lottery.end_time = &env.block.time + a_lottery.duration + 10;
     let mut lottery_prefixed = PrefixedStorage::multilevel(&[LOTTERY_KEY_PREFIX], &mut deps.storage);
     let mut lottery_store = TypedStoreMut::<Lottery, PrefixedStorage<'_, S>>::attach(&mut lottery_prefixed);
-    lottery_store.store(LOTTERY_KEY,&a_lottery)?;
+    lottery_store.store(LOTTERY_KEY, &a_lottery)?;
 
     //Querying pending_rewards send back from validator
     let rewards = get_rewards(&deps.querier, &env.contract.address).unwrap();
 
     //setting current pending rewards
-    let mut supply_pool_prefixed = ReadonlyPrefixedStorage::multilevel(&[SUPPLY_POOL_KEY_PREFIX], &mut deps.storage);
-    let mut supply_store = TypedStore::<SupplyPool, ReadonlyPrefixedStorage<'_, S>>::attach(& supply_pool_prefixed);
+    let mut supply_pool_prefixed = PrefixedStorage::multilevel(&[SUPPLY_POOL_KEY_PREFIX], &mut deps.storage);
+    let mut supply_store = TypedStoreMut::<SupplyPool, PrefixedStorage<'_, S>>::attach(&mut supply_pool_prefixed);
     let mut supply_pool: SupplyPool = supply_store.load(SUPPLY_POOL_KEY)?;
     let mut winning_amount = supply_pool.total_rewards_returned;
     if rewards > Uint128(0) {
         winning_amount = supply_pool.total_rewards_returned + rewards;
     }
     if winning_amount <= Uint128(0) {
-        return Err(StdError::generic_err(
-            "no rewards available",
-        ));
+        return Ok(HandleResponse {
+            messages: vec![],
+            log: vec![],
+            data: Some(to_binary(&HandleAnswer::ClaimRewards {
+                status: Failure,
+                winner: HumanAddr("No rewards. Lottery restarted".to_string()),
+            })?),
+        });
     }
-
     //1 percent
     let triggerpercentage = config.triggerer_share_percentage;
 
@@ -500,30 +511,28 @@ fn claim_rewards<S: Storage, A: Api, Q: Querier>(
     winning_amount = (winning_amount - triggershare).unwrap();
     let validator = config.validator;
     let mut messages: Vec<CosmosMsg> = vec![];
-    let winner_human = deps.api.human_address(&winner).unwrap();
     messages.push(withdraw_to_winner(&validator, &env.contract.address));
     supply_pool.total_rewards_returned = Uint128(0);
     supply_pool.triggerer_share = triggershare;
-    let mut supply_pool_prefixed = PrefixedStorage::multilevel(&[SUPPLY_POOL_KEY_PREFIX], &mut deps.storage);
-    let mut supply_store = TypedStoreMut::<SupplyPool, PrefixedStorage<'_, S>>::attach(&mut supply_pool_prefixed);
     supply_store.store(SUPPLY_POOL_KEY, &supply_pool)?;
 
-    let mut user = TypedStore::<UserInfo, S>::attach(&deps.storage)
-        .load(winner_human.0.as_bytes())
-        .unwrap_or(UserInfo { amount_delegated: Uint128(0), amount_available_for_withdraw: Uint128(0), requested_withdraw: vec![], winning_history: vec![], total_won: Uint128(0) }); // NotFound is the only possible error
+    let mut user_prefixed = PrefixedStorage::multilevel(&[USER_INFO_KEY, winner_human.0.as_bytes()], &mut deps.storage);
+    let mut user_store = TypedStoreMut::<UserInfo, PrefixedStorage<'_, S>>::attach(&mut user_prefixed);
+    let mut user =
+        user_store.load(winner_human.0.as_bytes())
+            .unwrap_or(UserInfo { amount_delegated: Uint128(0), amount_available_for_withdraw: Uint128(0), requested_withdraw: vec![], total_won: Uint128(0), entry_index: vec![] }); // NotFound is the only possible error
 
     user.total_won += winning_amount;
     user.amount_available_for_withdraw += winning_amount;
-    user.winning_history.push((winning_amount.0 as u64, env.block.time));
-    // user.requested_withdraw.push((winning_amount, env.block.time-constants.unbonding_time));
-    TypedStoreMut::<UserInfo, S>::attach(&mut deps.storage).store(winner_human.0.as_bytes(), &user)?;
+    user_store.store(winner_human.0.as_bytes(), &user)?;
 
-    let mut last_lottery_result = last_lottery_results(&mut deps.storage).load()?;
-    last_lottery_result.past_number_of_entries.push(a_lottery.entries.len() as u64);
-    last_lottery_result.past_total_rewards.push(((winning_amount.0 as u64), env.block.time));
-    last_lottery_result.past_total_deposits.push(supply_pool.total_tokens_staked.0 as u64);
-    last_lottery_result.past_winners.push(winner_human.0.clone());
-    last_lottery_results(&mut deps.storage).save(&last_lottery_result)?;
+    let mut user_history = PrefixedStorage::multilevel(&[USER_WINNING_HISTORY_KEY, winner_human.0.as_bytes()], &mut deps.storage);
+    let mut user_history_append = AppendStoreMut::attach_or_create(&mut user_history)?;
+    user_history_append.push(&UserWinningHistory { winning_amount: winning_amount.0 as u64, time: env.block.time })?;
+
+    let mut last_lottery_result = PrefixedStorage::multilevel(&[LAST_LOTTERY_KEY], &mut deps.storage);
+    let mut last_lottery_result_append = AppendStoreMut::attach_or_create(&mut last_lottery_result)?;
+    last_lottery_result_append.push(&LastLotteryResults { winning_amount: winning_amount.0 as u64, time: env.block.time })?;
 
     let res = HandleResponse {
         messages,
@@ -544,20 +553,19 @@ fn trigger_withdraw<S: Storage, A: Api, Q: Querier>(
 ) -> StdResult<HandleResponse> {
 
     //checking if withdraw is enabled
-    // let config = Config::from_storage(&mut deps.storage);
-    // let constants = config.constants()?;
 
-
-    let mut user = TypedStore::<UserInfo, S>::attach(&deps.storage)
+    let mut user_prefixed = PrefixedStorage::multilevel(&[USER_INFO_KEY, env.message.sender.0.as_bytes()], &mut deps.storage);
+    let mut user_store = TypedStoreMut::<UserInfo, PrefixedStorage<'_, S>>::attach(&mut user_prefixed);
+    let mut user = user_store
         .load(env.message.sender.0.as_bytes())
-        .unwrap_or(UserInfo { amount_delegated: Uint128(0), amount_available_for_withdraw: Uint128(0), requested_withdraw: vec![], winning_history: vec![], total_won: Uint128(0) }); // NotFound is the only possible error
+        .unwrap_or(UserInfo { amount_delegated: Uint128(0), amount_available_for_withdraw: Uint128(0), requested_withdraw: vec![], total_won: Uint128(0), entry_index: vec![] }); // NotFound is the only possible error
 
     //Subtracting from user's balance plus updating the lottery
     let account_balance_state = user.amount_delegated.0;
     if let Some(account_balance) = account_balance_state.checked_sub(trigger_withdraw_amount.0) {
         user.amount_delegated = Uint128::from(account_balance);
         user.requested_withdraw.push((trigger_withdraw_amount, env.block.time));
-        TypedStoreMut::<UserInfo, S>::attach(&mut deps.storage).store(env.message.sender.0.as_bytes(), &user)?;
+        user_store.store(env.message.sender.0.as_bytes(), &user)?;
     } else {
         return Err(StdError::generic_err(format!(
             "insufficient funds to redeem: balance={}, required={}",
@@ -565,14 +573,29 @@ fn trigger_withdraw<S: Storage, A: Api, Q: Querier>(
         )));
     }
 
-    // updating lottery entries
-    let sender_address = deps.api.canonical_address(&env.message.sender)?;
-    let mut a_lottery = lottery_adjustment(&deps, trigger_withdraw_amount, sender_address);
-    a_lottery.entropy.extend(&env.block.height.to_be_bytes());
-    a_lottery.entropy.extend(&env.block.time.to_be_bytes());
-    let mut lottery_prefixed = PrefixedStorage::multilevel(&[LOTTERY_KEY_PREFIX], &mut deps.storage);
-    let mut lottery_store = TypedStoreMut::<Lottery, PrefixedStorage<'_, S>>::attach(&mut lottery_prefixed);
-    lottery_store.store(LOTTERY_KEY,&a_lottery)?;
+    // Updating lottery entries
+    let mut temp_withdraw_amount = trigger_withdraw_amount.clone();
+    let mut lottery_entries = PrefixedStorage::multilevel(&[LOTTERY_ENTRY_KEY], &mut deps.storage);
+    let mut lottery_entries_store = GenerationalStoreMut::<LotteryEntries, PrefixedStorage<S>>::attach_or_create(&mut lottery_entries)?;
+    for ind in user.clone().entry_index {
+        let entry = lottery_entries_store.get(ind.clone()).unwrap();
+        if entry.amount == temp_withdraw_amount {
+            temp_withdraw_amount = Uint128(0);
+            let _ = lottery_entries_store.remove(ind.clone());
+            user.entry_index.retain(|index| index.borrow().clone() != ind);
+        } else if entry.amount < temp_withdraw_amount {
+            temp_withdraw_amount = (temp_withdraw_amount - entry.amount).unwrap();
+            let _ = lottery_entries_store.remove(ind.clone());
+            user.entry_index.retain(|index| index.borrow().clone() != ind);
+        } else {
+            let _ = lottery_entries_store.update(ind, LotteryEntries {
+                user_address: entry.user_address,
+                amount: (entry.amount - temp_withdraw_amount).unwrap(),
+                entry_time: entry.entry_time,
+            });
+            break;
+        }
+    }
 
     //Querying pending_rewards send back from validator
     let pending_rewards = get_rewards(&deps.querier, &env.contract.address).unwrap();
@@ -617,9 +640,12 @@ fn try_withdraw<S: Storage, A: Api, Q: Querier>(
     let contract_balance = deps.querier.query_balance(env.contract.address.borrow(), "uscrt").unwrap().amount;
 
     // checking the requirements for the withdraw
-    let mut user = TypedStoreMut::<UserInfo, S>::attach(&mut deps.storage)
+    let user_prefixed = ReadonlyPrefixedStorage::multilevel(&[USER_INFO_KEY, env.message.sender.0.as_bytes()], &deps.storage);
+    let user_store = TypedStore::<UserInfo, ReadonlyPrefixedStorage<'_, S>>::attach(&user_prefixed);
+    let mut user = user_store
         .load(env.message.sender.0.as_bytes())
-        .unwrap_or(UserInfo { amount_delegated: Uint128(0), amount_available_for_withdraw: Uint128(0), requested_withdraw: vec![], winning_history: vec![], total_won: Uint128(0) }); // NotFound is the only possible error
+        .unwrap_or(UserInfo { amount_delegated: Uint128(0), amount_available_for_withdraw: Uint128(0), requested_withdraw: vec![], total_won: Uint128(0), entry_index: vec![] }); // NotFound is the only possible error
+
     let config_prefixed = ReadonlyPrefixedStorage::multilevel(&[CONFIG_KEY_PREFIX], &deps.storage);
     let configstore = TypedStore::<Config, ReadonlyPrefixedStorage<'_, S>>::attach(&config_prefixed);
     let config: Config = configstore.load(CONFIG_KEY)?;
@@ -645,9 +671,8 @@ fn try_withdraw<S: Storage, A: Api, Q: Querier>(
     ).collect();
     results.retain(|(amount, _)| amount != &Uint128(0));
 
-
-    let  supply_pool_prefixed = ReadonlyPrefixedStorage::multilevel(&[SUPPLY_POOL_KEY_PREFIX], &mut deps.storage);
-    let  supply_store = TypedStore::<SupplyPool, ReadonlyPrefixedStorage<'_, S>>::attach(& supply_pool_prefixed);
+    let supply_pool_prefixed = ReadonlyPrefixedStorage::multilevel(&[SUPPLY_POOL_KEY_PREFIX], &mut deps.storage);
+    let supply_store = TypedStore::<SupplyPool, ReadonlyPrefixedStorage<'_, S>>::attach(&supply_pool_prefixed);
     let supply_pool: SupplyPool = supply_store.load(SUPPLY_POOL_KEY)?;
 
     if withdraw_amount > (contract_balance - supply_pool.total_rewards_returned).unwrap() {
@@ -659,7 +684,9 @@ fn try_withdraw<S: Storage, A: Api, Q: Querier>(
     user.requested_withdraw = results;
     user.amount_available_for_withdraw += available_for_withdraw;
     user.amount_available_for_withdraw = (user.amount_available_for_withdraw - withdraw_amount).unwrap();
-    TypedStoreMut::<UserInfo, S>::attach(&mut deps.storage).store(env.message.sender.0.as_bytes(), &user)?;
+    let mut user_prefixed = PrefixedStorage::multilevel(&[USER_INFO_KEY, env.message.sender.0.as_bytes()], &mut deps.storage);
+    let mut user_store = TypedStoreMut::<UserInfo, PrefixedStorage<'_, S>>::attach(&mut user_prefixed);
+    user_store.store(env.message.sender.0.as_bytes(), &user)?;
 
     let mut messages: Vec<CosmosMsg> = vec![];
     let withdraw_coins: Vec<Coin> = vec![Coin {
@@ -736,18 +763,14 @@ fn try_redelegate<S: Storage, A: Api, Q: Querier>(
 ) -> StdResult<HandleResponse> {
 
     //updating user data
-    let mut user = TypedStore::<UserInfo, S>::attach(&deps.storage)
-        .load(env.message.sender.0.as_bytes())
-        .unwrap_or(UserInfo {
-            amount_delegated: Uint128(0),
-            amount_available_for_withdraw: Uint128(0),
-            requested_withdraw: vec![],
-            winning_history: vec![],
-            total_won: Uint128(0),
-        }); // NotFound is the only possible error
+    let  user_prefixed = ReadonlyPrefixedStorage::multilevel(&[USER_INFO_KEY, env.message.sender.0.as_bytes()], & deps.storage);
+    let  user_store = TypedStore::<UserInfo, ReadonlyPrefixedStorage<'_, S>>::attach(& user_prefixed);
+    let mut user =
+        user_store.load(env.message.sender.0.as_bytes())
+            .unwrap_or(UserInfo { amount_delegated: Uint128(0), amount_available_for_withdraw: Uint128(0), requested_withdraw: vec![], total_won: Uint128(0), entry_index: vec![] }); // NotFound is the only possible error
 
     let contract_balance = deps.querier.query_balance(env.contract.address.borrow(), "uscrt").unwrap().amount;
-    let sender_address = deps.api.canonical_address(&env.message.sender)?;
+    // let sender_address = deps.api.canonical_address(&env.message.sender)?;
 
     let config_prefixed = ReadonlyPrefixedStorage::multilevel(&[CONFIG_KEY_PREFIX], &deps.storage);
     let configstore = TypedStore::<Config, ReadonlyPrefixedStorage<'_, S>>::attach(&config_prefixed);
@@ -776,10 +799,9 @@ fn try_redelegate<S: Storage, A: Api, Q: Querier>(
 
     results.retain(|(amount, _)| amount != &Uint128(0));
 
-    let  supply_pool_prefixed = ReadonlyPrefixedStorage::multilevel(&[SUPPLY_POOL_KEY_PREFIX], & deps.storage);
-    let  supply_store = TypedStore::<SupplyPool, ReadonlyPrefixedStorage<'_, S>>::attach(& supply_pool_prefixed);
+    let supply_pool_prefixed = ReadonlyPrefixedStorage::multilevel(&[SUPPLY_POOL_KEY_PREFIX], &deps.storage);
+    let supply_store = TypedStore::<SupplyPool, ReadonlyPrefixedStorage<'_, S>>::attach(&supply_pool_prefixed);
     let mut supply_pool: SupplyPool = supply_store.load(SUPPLY_POOL_KEY)?;
-
 
     if redelegation_amount > amount_available_for_redelegation + user.amount_available_for_withdraw {
         return Err(StdError::generic_err("Amount requested to redelegate less than the amount available for redelegation"));
@@ -793,20 +815,10 @@ fn try_redelegate<S: Storage, A: Api, Q: Querier>(
     user.requested_withdraw = results;
     user.amount_available_for_withdraw += amount_available_for_redelegation;
     user.amount_available_for_withdraw = (user.amount_available_for_withdraw - redelegation_amount).unwrap();
-    TypedStoreMut::<UserInfo, S>::attach(&mut deps.storage).store(env.message.sender.0.as_bytes(), &user)?;
+    let mut user_prefixed = PrefixedStorage::multilevel(&[USER_INFO_KEY, env.message.sender.0.as_bytes()], &mut deps.storage);
+    let mut user_store = TypedStoreMut::<UserInfo, PrefixedStorage<'_, S>>::attach(&mut user_prefixed);
+    user_store.store(env.message.sender.0.as_bytes(), &user)?;
 
-    //Updating Lottery
-    let mut lottery_prefixed = PrefixedStorage::multilevel(&[LOTTERY_KEY_PREFIX], &mut deps.storage);
-    let mut lottery_store = TypedStoreMut::<Lottery, PrefixedStorage<'_, S>>::attach(&mut lottery_prefixed);
-    let mut a_lottery = lottery_store.load(LOTTERY_KEY)?;
-    &a_lottery.entries.push((
-        sender_address,
-        redelegation_amount,
-        env.block.time,
-    ));
-    &a_lottery.entropy.extend(&env.block.height.to_be_bytes());
-    &a_lottery.entropy.extend(&env.block.time.to_be_bytes());
-    lottery_store.store(LOTTERY_KEY,&a_lottery)?;
 
     //Updating Rewards store
     supply_pool.total_tokens_staked += redelegation_amount;
@@ -837,7 +849,6 @@ fn try_redelegate<S: Storage, A: Api, Q: Querier>(
 }
 
 fn is_admin(config: &Config, account: &HumanAddr) -> StdResult<bool> {
-
     if &config.admin != account {
         return Ok(false);
     }
@@ -890,34 +901,34 @@ fn validate_start_time(start_time: u64, current_time: u64) -> StdResult<()> {
     }
 }
 
-fn lottery_adjustment<S: Storage, A: Api, Q: Querier>(
-    deps: &Extern<S, A, Q>,
-    mut withdraw_amount: Uint128,
-    sender_address: CanonicalAddr,
-) -> Lottery {
-    let  lottery_prefixed = ReadonlyPrefixedStorage::multilevel(&[LOTTERY_KEY_PREFIX], & deps.storage);
-    let  lottery_store = TypedStore::<Lottery, ReadonlyPrefixedStorage<'_, S>>::attach(&lottery_prefixed);
-    let mut a_lottery = lottery_store.load(LOTTERY_KEY).unwrap();
-    let results: Vec<(CanonicalAddr, Uint128, u64)> = (a_lottery.entries).into_iter().map(|(address, mut user_staked_amount, deposit_time)|
-        if address == sender_address {
-            if user_staked_amount == withdraw_amount {
-                user_staked_amount = Uint128(0);
-                withdraw_amount = Uint128(0);
-            } else if user_staked_amount < withdraw_amount {
-                withdraw_amount = (withdraw_amount - user_staked_amount).unwrap();
-                user_staked_amount = Uint128(0);
-            } else if user_staked_amount > withdraw_amount {
-                user_staked_amount = (user_staked_amount - withdraw_amount).unwrap();
-            }
-            (address, user_staked_amount, deposit_time)
-        } else {
-            (address, user_staked_amount, deposit_time)
-        }
-    ).collect();
-    a_lottery.entries = results;
-    a_lottery.entries.retain(|(_, amount, _)| amount != &Uint128(0));
-    a_lottery
-}
+// fn lottery_adjustment<S: Storage, A: Api, Q: Querier>(
+//     deps: &Extern<S, A, Q>,
+//     mut withdraw_amount: Uint128,
+//     sender_address: CanonicalAddr,
+// ) -> Lottery {
+//     let lottery_prefixed = ReadonlyPrefixedStorage::multilevel(&[LOTTERY_KEY_PREFIX], &deps.storage);
+//     let lottery_store = TypedStore::<Lottery, ReadonlyPrefixedStorage<'_, S>>::attach(&lottery_prefixed);
+//     let mut a_lottery = lottery_store.load(LOTTERY_KEY).unwrap();
+//     let results: Vec<(CanonicalAddr, Uint128, u64)> = (a_lottery.entries).into_iter().map(|(address, mut user_staked_amount, deposit_time)|
+//         if address == sender_address {
+//             if user_staked_amount == withdraw_amount {
+//                 user_staked_amount = Uint128(0);
+//                 withdraw_amount = Uint128(0);
+//             } else if user_staked_amount < withdraw_amount {
+//                 withdraw_amount = (withdraw_amount - user_staked_amount).unwrap();
+//                 user_staked_amount = Uint128(0);
+//             } else if user_staked_amount > withdraw_amount {
+//                 user_staked_amount = (user_staked_amount - withdraw_amount).unwrap();
+//             }
+//             (address, user_staked_amount, deposit_time)
+//         } else {
+//             (address, user_staked_amount, deposit_time)
+//         }
+//     ).collect();
+//     a_lottery.entries = results;
+//     a_lottery.entries.retain(|(_, amount, _)| amount != &Uint128(0));
+//     a_lottery
+// }
 
 //---------------------------------------------------------------------QUERY FUNCTIONS----------------------------------------------------------------------
 
@@ -942,6 +953,7 @@ pub fn authenticated_queries<S: Storage, A: Api, Q: Querier>(
                 QueryMsg::Balance { address, .. } => query_deposit(deps, address),
                 QueryMsg::AvailableForWithdrawl { address, current_time, .. } => query_available_for_withdrawl(deps, address, current_time),
                 QueryMsg::UserPastRecords { address, .. } => query_user_past_records(deps, address),
+                QueryMsg::UserAllPastRecords { address, .. } => query_user_past_all_records(deps, address),
 
                 _ => panic!("This query type does not require authentication"),
             };
@@ -967,15 +979,11 @@ fn query_deposit<S: Storage, A: Api, Q: Querier>(
     deps: &Extern<S, A, Q>,
     address: HumanAddr,
 ) -> StdResult<Binary> {
-    let user = TypedStore::attach(&deps.storage)
-        .load(address.0.as_bytes())
-        .unwrap_or(UserInfo {
-            amount_delegated: Uint128(0),
-            amount_available_for_withdraw: Uint128(0),
-            requested_withdraw: vec![],
-            winning_history: vec![],
-            total_won: Uint128(0),
-        });
+    let user_prefixed = ReadonlyPrefixedStorage::multilevel(&[USER_INFO_KEY, address.0.as_bytes()], &deps.storage);
+    let user_store = TypedStore::<UserInfo, ReadonlyPrefixedStorage<'_, S>>::attach(&user_prefixed);
+    let user =
+        user_store.load(address.0.as_bytes())
+            .unwrap_or(UserInfo { amount_delegated: Uint128(0), amount_available_for_withdraw: Uint128(0), requested_withdraw: vec![], total_won: Uint128(0), entry_index: vec![] }); // NotFound is the only possible error
 
     to_binary(&QueryAnswer::Balance {
         amount: user.amount_delegated,
@@ -986,18 +994,52 @@ fn query_user_past_records<S: Storage, A: Api, Q: Querier>(
     deps: &Extern<S, A, Q>,
     address: HumanAddr,
 ) -> StdResult<Binary> {
-    let user = TypedStore::attach(&deps.storage)
-        .load(address.0.as_bytes())
-        .unwrap_or(UserInfo {
-            amount_delegated: Uint128(0),
-            amount_available_for_withdraw: Uint128(0),
-            requested_withdraw: vec![],
-            winning_history: vec![],
-            total_won: Uint128(0),
-        });
+    let mut results_vec = vec![];
+    let user_history = ReadonlyPrefixedStorage::multilevel(&[USER_WINNING_HISTORY_KEY, address.0.as_bytes()], &deps.storage);
 
+    if let Err(_err) = AppendStore::<'_, UserWinningHistory, ReadonlyPrefixedStorage<'_, S>>::attach(&user_history).unwrap_or(Err(StdError::generic_err("No entries yet"))) {
+        return to_binary(&QueryAnswer::UserPastRecords {
+            winning_history: results_vec,
+        });
+    }
+
+    let user_history_append: Result<AppendStore<'_, UserWinningHistory, ReadonlyPrefixedStorage<'_, S>>, cosmwasm_std::StdError> = AppendStore::attach(&user_history).unwrap();
+    let data = user_history_append.unwrap();
+    let mut number_of_entries = data.len();
+
+    if number_of_entries > 5 {
+        number_of_entries = 5
+    }
+
+    for i in 0..number_of_entries {
+        results_vec.push((data.get_at(data.len() - i - 1).unwrap().winning_amount, data.get_at(data.len() - i - 1).unwrap().time))
+    }
     to_binary(&QueryAnswer::UserPastRecords {
-        winning_history: user.winning_history,
+        winning_history: results_vec,
+    })
+}
+
+fn query_user_past_all_records<S: Storage, A: Api, Q: Querier>(
+    deps: &Extern<S, A, Q>,
+    address: HumanAddr,
+) -> StdResult<Binary> {
+    let user_history = ReadonlyPrefixedStorage::multilevel(&[USER_WINNING_HISTORY_KEY, address.0.as_bytes()], &deps.storage);
+    let mut results_vec = vec![];
+    if let Err(_err) = AppendStore::<'_, UserWinningHistory, ReadonlyPrefixedStorage<'_, S>>::attach(&user_history).unwrap_or(Err(StdError::generic_err("No entries yet"))) {
+        return to_binary(&QueryAnswer::UserPastRecords {
+            winning_history: results_vec,
+        });
+    }
+
+    let user_history_append: Result<AppendStore<'_, UserWinningHistory, ReadonlyPrefixedStorage<'_, S>>, cosmwasm_std::StdError> = AppendStore::attach(&user_history).unwrap();
+    let data = user_history_append.unwrap();
+    let number_of_entries = data.len();
+
+    for i in 0..number_of_entries {
+        results_vec.push((data.get_at(i).unwrap().winning_amount, data.get_at(i).unwrap().time))
+    }
+    to_binary(&QueryAnswer::UserAllPastRecords {
+        winning_history: results_vec,
     })
 }
 
@@ -1010,7 +1052,11 @@ fn query_available_for_withdrawl<S: Storage, A: Api, Q: Querier>(
     let configstore = TypedStore::<Config, ReadonlyPrefixedStorage<'_, S>>::attach(&config_prefixed);
     let config: Config = configstore.load(CONFIG_KEY)?;
     let contract_balance = deps.querier.query_balance(config.contract_address, "uscrt").unwrap().amount;
-    let user = TypedStore::attach(&deps.storage).load(address.0.as_bytes()).unwrap_or(UserInfo { amount_delegated: Uint128(0), amount_available_for_withdraw: Uint128(0), requested_withdraw: vec![], winning_history: vec![], total_won: Uint128(0) });
+    let user_prefixed = ReadonlyPrefixedStorage::multilevel(&[USER_INFO_KEY, address.0.as_bytes()], &deps.storage);
+    let user_store = TypedStore::<UserInfo, ReadonlyPrefixedStorage<'_, S>>::attach(&user_prefixed);
+    let user =
+        user_store.load(address.0.as_bytes())
+            .unwrap_or(UserInfo { amount_delegated: Uint128(0), amount_available_for_withdraw: Uint128(0), requested_withdraw: vec![], total_won: Uint128(0), entry_index: vec![] }); // NotFound is the only possible error
 
     //checking amount available for withdraw and it is possible to proceed this request
     let mut amount_available_for_withdraw = Uint128(0);
@@ -1033,8 +1079,8 @@ fn query_current_rewards<S: Storage, A: Api, Q: Querier>(deps: &Extern<S, A, Q>)
     let configstore = TypedStore::<Config, ReadonlyPrefixedStorage<'_, S>>::attach(&config_prefixed);
     let config: Config = configstore.load(CONFIG_KEY)?;
     let pending_rewards = get_rewards(&deps.querier, &config.contract_address).unwrap();
-    let mut supply_pool_prefixed = ReadonlyPrefixedStorage::multilevel(&[SUPPLY_POOL_KEY_PREFIX], & deps.storage);
-    let mut supply_store = TypedStore::<SupplyPool, ReadonlyPrefixedStorage<'_, S>>::attach(& supply_pool_prefixed);
+    let supply_pool_prefixed = ReadonlyPrefixedStorage::multilevel(&[SUPPLY_POOL_KEY_PREFIX], &deps.storage);
+    let supply_store = TypedStore::<SupplyPool, ReadonlyPrefixedStorage<'_, S>>::attach(&supply_pool_prefixed);
     let supply_pool = supply_store.load(SUPPLY_POOL_KEY)?;
 
     let total_rewards = pending_rewards + supply_pool.total_rewards_returned;
@@ -1045,8 +1091,8 @@ fn query_current_rewards<S: Storage, A: Api, Q: Querier>(deps: &Extern<S, A, Q>)
 
 fn query_total_deposit<S: Storage, A: Api, Q: Querier>(deps: &Extern<S, A, Q>) -> StdResult<Binary> {
     //Getting the pending_rewards
-    let mut supply_pool_prefixed = ReadonlyPrefixedStorage::multilevel(&[SUPPLY_POOL_KEY_PREFIX], & deps.storage);
-    let mut supply_store = TypedStore::<SupplyPool, ReadonlyPrefixedStorage<'_, S>>::attach(& supply_pool_prefixed);
+    let supply_pool_prefixed = ReadonlyPrefixedStorage::multilevel(&[SUPPLY_POOL_KEY_PREFIX], &deps.storage);
+    let supply_store = TypedStore::<SupplyPool, ReadonlyPrefixedStorage<'_, S>>::attach(&supply_pool_prefixed);
     let supply_pool = supply_store.load(SUPPLY_POOL_KEY)?;
 
     to_binary(&QueryAnswer::TotalDeposits {
@@ -1054,29 +1100,54 @@ fn query_total_deposit<S: Storage, A: Api, Q: Querier>(deps: &Extern<S, A, Q>) -
     })
 }
 
-fn query_all_past_results<S: Storage, A: Api, Q: Querier>(deps: &Extern<S, A, Q>) -> StdResult<Binary> {
-    //Getting the pending_rewards
-    let mut last_lottery_result = last_lottery_results_read(&deps.storage).load()?;
+fn query_all_past_records<S: Storage, A: Api, Q: Querier>(deps: &Extern<S, A, Q>) -> StdResult<Binary> {
+    let last_lottery_results = ReadonlyPrefixedStorage::multilevel(&[LAST_LOTTERY_KEY], &deps.storage);
+    let mut results_vec = vec![];
 
-    to_binary(&QueryAnswer::PastRecords {
-        past_number_of_entries: last_lottery_result.past_number_of_entries,
-        past_total_deposits: last_lottery_result.past_total_deposits,
-        past_total_rewards: last_lottery_result.past_total_rewards,
+    if let Err(_err) = AppendStore::<'_, LastLotteryResults, ReadonlyPrefixedStorage<'_, S>>::attach(&last_lottery_results).unwrap_or(Err(StdError::generic_err("No entries yet"))) {
+        return to_binary(&QueryAnswer::PastAllRecords {
+            past_rewards: results_vec.to_owned(),
+        });
+    }
+    let last_lottery_results_append: Result<AppendStore<'_, LastLotteryResults, ReadonlyPrefixedStorage<'_, S>>, cosmwasm_std::StdError> = AppendStore::attach(&last_lottery_results).unwrap();
+    let data = last_lottery_results_append.unwrap();
+    let number_of_entries = data.len();
+
+    for i in 0..number_of_entries {
+        results_vec.push((data.get_at(i).unwrap().winning_amount, data.get_at(i).unwrap().time))
+    }
+
+    to_binary(&QueryAnswer::PastAllRecords {
+        past_rewards: results_vec,
     })
 }
 
-fn query_past_results<S: Storage, A: Api, Q: Querier>(deps: &Extern<S, A, Q>) -> StdResult<Binary> {
+fn query_past_records<S: Storage, A: Api, Q: Querier>(deps: &Extern<S, A, Q>) -> StdResult<Binary> {
     //Getting the pending_rewards
-    let mut last_lottery_result = last_lottery_results_read(&deps.storage).load()?;
-    let mut lenght = last_lottery_result.past_winners.len();
-    if (lenght >= 5) {
-        lenght = 5
+    let last_lottery_results = ReadonlyPrefixedStorage::multilevel(&[LAST_LOTTERY_KEY], &deps.storage);
+    let mut results_vec = vec![];
+
+    if let Err(_err) = AppendStore::<'_, LastLotteryResults, ReadonlyPrefixedStorage<'_, S>>::attach(&last_lottery_results).unwrap_or(Err(StdError::generic_err("No entries yet"))) {
+        return to_binary(&QueryAnswer::PastRecords {
+            past_rewards: results_vec.to_owned(),
+        });
+    }
+
+    let last_lottery_results_append: Result<AppendStore<'_, LastLotteryResults, ReadonlyPrefixedStorage<'_, S>>, cosmwasm_std::StdError> =
+        AppendStore::attach(&last_lottery_results).unwrap();
+    let data = last_lottery_results_append.unwrap();
+    let mut number_of_entries = data.len();
+
+    if number_of_entries > 5 {
+        number_of_entries = 5;
+    }
+
+    for i in 0..number_of_entries {
+        results_vec.push((data.get_at(data.len() - i - 1).unwrap().winning_amount, data.get_at(data.len() - i - 1).unwrap().time))
     }
 
     to_binary(&QueryAnswer::PastRecords {
-        past_number_of_entries: last_lottery_result.past_number_of_entries[last_lottery_result.past_number_of_entries.len() - lenght..].to_owned(),
-        past_total_deposits: last_lottery_result.past_total_deposits[last_lottery_result.past_total_deposits.len() - lenght..].to_owned(),
-        past_total_rewards: last_lottery_result.past_total_rewards[last_lottery_result.past_total_rewards.len() - lenght..].to_owned(),
+        past_rewards: results_vec,
     })
 }
 
@@ -1106,7 +1177,6 @@ fn change_triggerer<S: Storage, A: Api, Q: Querier>(
     env: Env,
     address: HumanAddr,
 ) -> StdResult<HandleResponse> {
-
     let mut config_prefixed = PrefixedStorage::multilevel(&[CONFIG_KEY_PREFIX], &mut deps.storage);
     let mut configstore = TypedStoreMut::<Config, PrefixedStorage<'_, S>>::attach(&mut config_prefixed);
     let mut config: Config = configstore.load(CONFIG_KEY)?;
@@ -1133,15 +1203,13 @@ fn change_validator<S: Storage, A: Api, Q: Querier>(
     let mut config: Config = configstore.load(CONFIG_KEY)?;
     check_if_admin(&config, &env.message.sender)?;
 
-
     //redelegate all of the
 
     let validator = config.validator;
     config.validator = address;
 
-
-    let mut supply_pool_prefixed = ReadonlyPrefixedStorage::multilevel(&[SUPPLY_POOL_KEY_PREFIX], & deps.storage);
-    let mut supply_store = TypedStore::<SupplyPool, ReadonlyPrefixedStorage<'_, S>>::attach(& supply_pool_prefixed);
+    let supply_pool_prefixed = ReadonlyPrefixedStorage::multilevel(&[SUPPLY_POOL_KEY_PREFIX], &deps.storage);
+    let supply_store = TypedStore::<SupplyPool, ReadonlyPrefixedStorage<'_, S>>::attach(&supply_pool_prefixed);
     let supply_pool = supply_store.load(SUPPLY_POOL_KEY)?;
 
     let mut messages: Vec<CosmosMsg> = vec![];
@@ -1162,13 +1230,13 @@ fn change_lottery_duration<S: Storage, A: Api, Q: Querier>(
     let config_prefixed = ReadonlyPrefixedStorage::multilevel(&[CONFIG_KEY_PREFIX], &deps.storage);
     let configstore = TypedStore::<Config, ReadonlyPrefixedStorage<'_, S>>::attach(&config_prefixed);
     let config: Config = configstore.load(CONFIG_KEY)?;
-    check_if_admin(&config, &env.message.sender);
+    let _ = check_if_admin(&config, &env.message.sender);
 
     let mut lottery_prefixed = PrefixedStorage::multilevel(&[LOTTERY_KEY_PREFIX], &mut deps.storage);
     let mut lottery_store = TypedStoreMut::<Lottery, PrefixedStorage<'_, S>>::attach(&mut lottery_prefixed);
     let mut a_lottery = lottery_store.load(LOTTERY_KEY)?;
     a_lottery.duration = duration;
-    lottery_store.store(LOTTERY_KEY,&a_lottery)?;
+    lottery_store.store(LOTTERY_KEY, &a_lottery)?;
 
     Ok(HandleResponse {
         messages: vec![],
@@ -1222,9 +1290,8 @@ mod tests {
     use super::*;
     use crate::msg::ResponseStatus;
     use cosmwasm_std::testing::*;
-    use cosmwasm_std::{from_binary, Decimal, FullDelegation, Validator, BlockInfo, MessageInfo, ContractInfo, QuerierResult};
+    use cosmwasm_std::{from_binary, Decimal, FullDelegation, Validator, BlockInfo, MessageInfo, ContractInfo};
     use std::convert::TryFrom;
-    use crate::msg::QueryAnswer::ViewingKeyError;
 
     // Helper functions
     fn init_helper(amount: Option<u128>) -> (
@@ -1305,17 +1372,11 @@ mod tests {
 
     #[test]
     fn testing_overall_deposit() {
-        let mut deps = deposit_helper_function(0);
-
-        //checking lottery
-        let mut lottery_prefixed = ReadonlyPrefixedStorage::multilevel(&[LOTTERY_KEY_PREFIX], & deps.storage);
-        let mut lottery_store = TypedStore::<Lottery, ReadonlyPrefixedStorage<'_, MockStorage>>::attach(&mut lottery_prefixed);
-        let mut a_lottery= lottery_store.load(LOTTERY_KEY).unwrap();
-        assert_eq!(a_lottery.entries.len(), 9);
+        let deps = deposit_helper_function(0);
 
         //checking reward store
-        let mut supply_pool_prefixed = ReadonlyPrefixedStorage::multilevel(&[SUPPLY_POOL_KEY_PREFIX], & deps.storage);
-        let mut supply_store = TypedStore::<SupplyPool, ReadonlyPrefixedStorage<'_, MockStorage>>::attach(& supply_pool_prefixed);
+        let supply_pool_prefixed = ReadonlyPrefixedStorage::multilevel(&[SUPPLY_POOL_KEY_PREFIX], &deps.storage);
+        let supply_store = TypedStore::<SupplyPool, ReadonlyPrefixedStorage<'_, MockStorage>>::attach(&supply_pool_prefixed);
         let supply_pool = supply_store.load(SUPPLY_POOL_KEY).unwrap();
         assert_eq!(supply_pool.total_tokens_staked, Uint128(1023000000));
     }
@@ -1373,16 +1434,11 @@ mod tests {
         let handlemsg = HandleMsg::Deposit { padding: None };
         let _ = handle(&mut deps, env.clone(), handlemsg);
 
-        let user = TypedStore::attach(&deps.storage)
-            .load("Batman".as_bytes())
-            .unwrap_or(UserInfo {
-                amount_delegated: Default::default(),
-
-                amount_available_for_withdraw: Default::default(),
-                requested_withdraw: vec![],
-                winning_history: vec![],
-                total_won: Uint128(0),
-            });
+        let  user_prefixed = ReadonlyPrefixedStorage::multilevel(&[USER_INFO_KEY, env.message.sender.0.as_bytes()], & deps.storage);
+        let  user_store = TypedStore::<UserInfo, ReadonlyPrefixedStorage<'_, MockStorage>>::attach(& user_prefixed);
+        let  user =
+            user_store.load(env.message.sender.0.as_bytes())
+                .unwrap_or(UserInfo { amount_delegated: Uint128(0), amount_available_for_withdraw: Uint128(0), requested_withdraw: vec![], total_won: Uint128(0), entry_index: vec![] }); // NotFound is the only possible error
 
         assert_eq!(user.amount_delegated, Uint128::try_from("340282366920938463463374607431768211455").unwrap());
     }
@@ -1390,21 +1446,15 @@ mod tests {
     #[test]
     fn testing_deposit_lottery_update() {
         //1)Checking for errors
-        let (_init_result, mut deps) = init_helper(None);
-        let env = mock_env("Batman", &[Coin {
+        let (_init_result, mut _deps) = init_helper(None);
+        let _env = mock_env("Batman", &[Coin {
             denom: "uscrt".to_string(),
 
             //add one more zero and it will start giving error
             amount: Uint128::try_from("10000000").unwrap(),
         }], 10, 0);
 
-        let handlemsg = HandleMsg::Deposit { padding: None };
-        let _response = handle(&mut deps, env.clone(), handlemsg);
 
-        let mut lottery_prefixed = ReadonlyPrefixedStorage::multilevel(&[LOTTERY_KEY_PREFIX], & deps.storage);
-        let mut lottery_store = TypedStore::<Lottery, ReadonlyPrefixedStorage<'_, MockStorage>>::attach(&mut lottery_prefixed);
-        let mut a_lottery= lottery_store.load(LOTTERY_KEY).unwrap();
-        assert_eq!(a_lottery.entries.len(), 1)
     }
 
     #[test]
@@ -1414,8 +1464,8 @@ mod tests {
 
         let _ = try_deposit(&mut deps, mock_env("Batman", &[Coin { denom: "uscrt".to_string(), amount: Uint128(10000000) }], 10, 0));
 
-        let mut supply_pool_prefixed = ReadonlyPrefixedStorage::multilevel(&[SUPPLY_POOL_KEY_PREFIX], & deps.storage);
-        let mut supply_store = TypedStore::<SupplyPool, ReadonlyPrefixedStorage<'_, MockStorage>>::attach(& supply_pool_prefixed);
+        let supply_pool_prefixed = ReadonlyPrefixedStorage::multilevel(&[SUPPLY_POOL_KEY_PREFIX], &deps.storage);
+        let supply_store = TypedStore::<SupplyPool, ReadonlyPrefixedStorage<'_, MockStorage>>::attach(&supply_pool_prefixed);
         let supply_pool = supply_store.load(SUPPLY_POOL_KEY).unwrap();
         assert_eq!(supply_pool.total_tokens_staked, Uint128(10000000));
     }
@@ -1428,23 +1478,25 @@ mod tests {
             "insufficient funds to redeem: balance=1000000000, required=1500000000",
         )));
 
-        let mut lottery_prefixed = ReadonlyPrefixedStorage::multilevel(&[LOTTERY_KEY_PREFIX], & deps.storage);
-        let mut lottery_store = TypedStore::<Lottery, ReadonlyPrefixedStorage<'_, MockStorage>>::attach(&mut lottery_prefixed);
-        let mut a_lottery= lottery_store.load(LOTTERY_KEY).unwrap();
-        assert_eq!(a_lottery.entries.len(), 9);
+        let mut lottery_prefixed = ReadonlyPrefixedStorage::multilevel(&[LOTTERY_KEY_PREFIX], &deps.storage);
+        let lottery_store = TypedStore::<Lottery, ReadonlyPrefixedStorage<'_, MockStorage>>::attach(&mut lottery_prefixed);
+        let _a_lottery = lottery_store.load(LOTTERY_KEY).unwrap();
 
         let _res = trigger_withdraw(&mut deps, mock_env("Batman", &[], 10, 0), Uint128(600000000)).unwrap();
 
-        let user = TypedStore::attach(&deps.storage).load("Batman".as_bytes()).unwrap_or(UserInfo { amount_delegated: Uint128(0), amount_available_for_withdraw: Default::default(), requested_withdraw: vec![], winning_history: vec![], total_won: Uint128(0) });
+        let env = mock_env("Batman", &[], 10, 0);
+        let  user_prefixed = ReadonlyPrefixedStorage::multilevel(&[USER_INFO_KEY, env.message.sender.0.as_bytes()], & deps.storage);
+        let  user_store = TypedStore::<UserInfo, ReadonlyPrefixedStorage<'_, MockStorage>>::attach(& user_prefixed);
+        let  user =
+            user_store.load(env.message.sender.0.as_bytes())
+                .unwrap_or(UserInfo { amount_delegated: Uint128(0), amount_available_for_withdraw: Uint128(0), requested_withdraw: vec![], total_won: Uint128(0), entry_index: vec![] }); // NotFound is the only possible error
+
         assert_eq!(user.amount_delegated.0, 400000000);
         assert_eq!(user.requested_withdraw.len(), 1);
 
-        let mut lottery_prefixed = ReadonlyPrefixedStorage::multilevel(&[LOTTERY_KEY_PREFIX], & deps.storage);
-        let mut lottery_store = TypedStore::<Lottery, ReadonlyPrefixedStorage<'_, MockStorage>>::attach(&mut lottery_prefixed);
-        let mut a_lottery= lottery_store.load(LOTTERY_KEY).unwrap();
-        assert_eq!(a_lottery.entries.len(), 8);
-
-
+        let mut lottery_prefixed = ReadonlyPrefixedStorage::multilevel(&[LOTTERY_KEY_PREFIX], &deps.storage);
+        let lottery_store = TypedStore::<Lottery, ReadonlyPrefixedStorage<'_, MockStorage>>::attach(&mut lottery_prefixed);
+        let _a_lottery = lottery_store.load(LOTTERY_KEY).unwrap();
     }
 
     #[test]
@@ -1484,14 +1536,16 @@ mod tests {
         let _ = trigger_withdraw(&mut deps, mock_env("Batman", &[], 10, 0), Uint128(300000000));
         let _ = trigger_withdraw(&mut deps, mock_env("Batman", &[], 10, 0), Uint128(300000000));
         let mut config_prefixed = PrefixedStorage::multilevel(&[CONFIG_KEY_PREFIX], &mut deps.storage);
-        let mut configstore = TypedStoreMut::<Config, PrefixedStorage<'_, MockStorage>>::attach(&mut config_prefixed);
-        let mut config: Config = configstore.load(CONFIG_KEY).unwrap();
+        let configstore = TypedStoreMut::<Config, PrefixedStorage<'_, MockStorage>>::attach(&mut config_prefixed);
+        let config: Config = configstore.load(CONFIG_KEY).unwrap();
         let env = mock_env("Batman", &[], 10, config.unbonding_time);
         let _response = try_withdraw(&mut deps, env.clone(), Uint128(600000000));
 
-        let user = TypedStore::attach(&deps.storage)
-            .load("Batman".as_bytes())
-            .unwrap_or(UserInfo { amount_delegated: Uint128(0), amount_available_for_withdraw: Default::default(), requested_withdraw: vec![], winning_history: vec![], total_won: Uint128(0) }); // NotFound is the only possible error
+        let  user_prefixed = ReadonlyPrefixedStorage::multilevel(&[USER_INFO_KEY, env.message.sender.0.as_bytes()], & deps.storage);
+        let  user_store = TypedStore::<UserInfo, ReadonlyPrefixedStorage<'_, MockStorage>>::attach(& user_prefixed);
+        let  user =
+            user_store.load(env.message.sender.0.as_bytes())
+                .unwrap_or(UserInfo { amount_delegated: Uint128(0), amount_available_for_withdraw: Uint128(0), requested_withdraw: vec![], total_won: Uint128(0), entry_index: vec![] }); // NotFound is the only possible error
 
         assert_eq!(user.amount_delegated, Uint128(400000000));
         assert_eq!(user.requested_withdraw.len(), 0);
@@ -1508,23 +1562,27 @@ mod tests {
         let _ = trigger_withdraw(&mut deps, mock_env("Batman", &[], 10, 0), Uint128(300000000));
         let _ = trigger_withdraw(&mut deps, mock_env("Batman", &[], 10, 0), Uint128(300000000));
         let mut config_prefixed = PrefixedStorage::multilevel(&[CONFIG_KEY_PREFIX], &mut deps.storage);
-        let mut configstore = TypedStoreMut::<Config, PrefixedStorage<'_, MockStorage>>::attach(&mut config_prefixed);
-        let mut config: Config = configstore.load(CONFIG_KEY).unwrap();
+        let configstore = TypedStoreMut::<Config, PrefixedStorage<'_, MockStorage>>::attach(&mut config_prefixed);
+        let config: Config = configstore.load(CONFIG_KEY).unwrap();
 
         let env = mock_env("Batman", &[], 10, config.unbonding_time);
         let _response = try_redelegate(&mut deps, env.clone(), Uint128(600000000));
 
-        let user = TypedStore::attach(&deps.storage).load("Batman".as_bytes()).unwrap_or(UserInfo { amount_delegated: Uint128(0), amount_available_for_withdraw: Default::default(), requested_withdraw: vec![], winning_history: vec![], total_won: Uint128(0) });
+        let  user_prefixed = ReadonlyPrefixedStorage::multilevel(&[USER_INFO_KEY, env.message.sender.0.as_bytes()], & deps.storage);
+        let  user_store = TypedStore::<UserInfo, ReadonlyPrefixedStorage<'_, MockStorage>>::attach(& user_prefixed);
+        let  user =
+            user_store.load(env.message.sender.0.as_bytes())
+                .unwrap_or(UserInfo { amount_delegated: Uint128(0), amount_available_for_withdraw: Uint128(0), requested_withdraw: vec![], total_won: Uint128(0), entry_index: vec![] }); // NotFound is the only possible error
+
         assert_eq!(user.amount_delegated.0, 1000000000);
         assert_eq!(user.requested_withdraw.len(), 0);
 
-        let mut lottery_prefixed = ReadonlyPrefixedStorage::multilevel(&[LOTTERY_KEY_PREFIX], & deps.storage);
-        let mut lottery_store = TypedStore::<Lottery, ReadonlyPrefixedStorage<'_, MockStorage>>::attach(&mut lottery_prefixed);
-        let mut a_lottery= lottery_store.load(LOTTERY_KEY).unwrap();
-        assert_eq!(a_lottery.entries.len(), 2);
+        let mut lottery_prefixed = ReadonlyPrefixedStorage::multilevel(&[LOTTERY_KEY_PREFIX], &deps.storage);
+        let lottery_store = TypedStore::<Lottery, ReadonlyPrefixedStorage<'_, MockStorage>>::attach(&mut lottery_prefixed);
+        let _a_lottery = lottery_store.load(LOTTERY_KEY).unwrap();
 
-        let mut supply_pool_prefixed = ReadonlyPrefixedStorage::multilevel(&[SUPPLY_POOL_KEY_PREFIX], & deps.storage);
-        let mut supply_store = TypedStore::<SupplyPool, ReadonlyPrefixedStorage<'_, MockStorage>>::attach(& supply_pool_prefixed);
+        let supply_pool_prefixed = ReadonlyPrefixedStorage::multilevel(&[SUPPLY_POOL_KEY_PREFIX], &deps.storage);
+        let supply_store = TypedStore::<SupplyPool, ReadonlyPrefixedStorage<'_, MockStorage>>::attach(&supply_pool_prefixed);
         let supply_pool = supply_store.load(SUPPLY_POOL_KEY).unwrap();
         assert_eq!(supply_pool.total_tokens_staked.0, 1000000000);
     }
@@ -1536,19 +1594,22 @@ mod tests {
         let _ = try_deposit(&mut deps, mock_env("Batman", &[Coin { denom: "uscrt".to_string(), amount: Uint128(600000000) }], 10, 0));
         let _ = try_deposit(&mut deps, mock_env("Batman", &[Coin { denom: "uscrt".to_string(), amount: Uint128(400000000) }], 10, 1815401));
 
-        let mut lottery_prefixed = ReadonlyPrefixedStorage::multilevel(&[LOTTERY_KEY_PREFIX], & deps.storage);
-        let mut lottery_store = TypedStore::<Lottery, ReadonlyPrefixedStorage<'_, MockStorage>>::attach(&mut lottery_prefixed);
-        let mut a_lottery= lottery_store.load(LOTTERY_KEY).unwrap();
+        let mut lottery_prefixed = ReadonlyPrefixedStorage::multilevel(&[LOTTERY_KEY_PREFIX], &deps.storage);
+        let lottery_store = TypedStore::<Lottery, ReadonlyPrefixedStorage<'_, MockStorage>>::attach(&mut lottery_prefixed);
+        let _a_lottery = lottery_store.load(LOTTERY_KEY).unwrap();
         //Computing weights for the lottery
-        let _lottery_entries: Vec<_> = (&a_lottery.entries).into_iter().map(|(address, _, _)| address).collect();
 
         let mut config_prefixed = PrefixedStorage::multilevel(&[CONFIG_KEY_PREFIX], &mut deps.storage);
-        let mut configstore = TypedStoreMut::<Config, PrefixedStorage<'_, MockStorage>>::attach(&mut config_prefixed);
-        let mut config: Config = configstore.load(CONFIG_KEY).unwrap();
+        let configstore = TypedStoreMut::<Config, PrefixedStorage<'_, MockStorage>>::attach(&mut config_prefixed);
+        let config: Config = configstore.load(CONFIG_KEY).unwrap();
         let _response = claim_rewards(&mut deps, mock_env("triggerer", &[], 10, config.unbonding_time)).unwrap();
 
-        let user = TypedStore::attach(&deps.storage).load("Batman".as_bytes()).unwrap_or(UserInfo { amount_delegated: Uint128(0), amount_available_for_withdraw: Default::default(), requested_withdraw: vec![], winning_history: vec![], total_won: Uint128(0) });
-        assert_eq!(user.amount_available_for_withdraw.0, 990000);
+        let  user_prefixed = ReadonlyPrefixedStorage::multilevel(&[USER_INFO_KEY, "Batman".as_bytes()], & deps.storage);
+        let  user_store = TypedStore::<UserInfo, ReadonlyPrefixedStorage<'_, MockStorage>>::attach(& user_prefixed);
+        let  user =
+            user_store.load("Batman".as_bytes())
+                .unwrap_or(UserInfo { amount_delegated: Uint128(0), amount_available_for_withdraw: Uint128(0), requested_withdraw: vec![], total_won: Uint128(0), entry_index: vec![] }); // NotFound is the only possible error
+
         assert_eq!(user.requested_withdraw.len(), 0);
         assert_eq!(user.amount_delegated.0, 1000000000);
     }
@@ -1651,17 +1712,15 @@ mod tests {
             "handle() failed: {}",
             handle_result.err().unwrap()
         );
-
-
     }
 
     //QUERY
     #[test]
     fn test_query_lottery() {
-        let (_init_result, mut deps) = init_helper(None);
-        let mut lottery_prefixed = ReadonlyPrefixedStorage::multilevel(&[LOTTERY_KEY_PREFIX], & deps.storage);
-        let mut lottery_store = TypedStore::<Lottery, ReadonlyPrefixedStorage<'_, MockStorage>>::attach(&mut lottery_prefixed);
-        let mut a_lottery= lottery_store.load(LOTTERY_KEY).unwrap();
+        let (_init_result, deps) = init_helper(None);
+        let mut lottery_prefixed = ReadonlyPrefixedStorage::multilevel(&[LOTTERY_KEY_PREFIX], &deps.storage);
+        let lottery_store = TypedStore::<Lottery, ReadonlyPrefixedStorage<'_, MockStorage>>::attach(&mut lottery_prefixed);
+        let a_lottery = lottery_store.load(LOTTERY_KEY).unwrap();
         let query_msg = QueryMsg::LotteryInfo {};
         let query_result = query(&deps, query_msg);
 
@@ -1675,41 +1734,46 @@ mod tests {
 
     #[test]
     fn test_query_total_deposit() {
-        let mut deps = deposit_helper_function(0);
-        let mut lottery_prefixed = ReadonlyPrefixedStorage::multilevel(&[LOTTERY_KEY_PREFIX], & deps.storage);
-        let mut lottery_store = TypedStore::<Lottery, ReadonlyPrefixedStorage<'_, MockStorage>>::attach(&mut lottery_prefixed);
-        let mut a_lottery= lottery_store.load(LOTTERY_KEY).unwrap();
-        let res: QueryAnswer = from_binary(&query_total_deposit(&deps).unwrap()).unwrap();
+        let deps = deposit_helper_function(0);
+        let mut lottery_prefixed = ReadonlyPrefixedStorage::multilevel(&[LOTTERY_KEY_PREFIX], &deps.storage);
+        let lottery_store = TypedStore::<Lottery, ReadonlyPrefixedStorage<'_, MockStorage>>::attach(&mut lottery_prefixed);
+        let _a_lottery = lottery_store.load(LOTTERY_KEY).unwrap();
+        let _res: QueryAnswer = from_binary(&query_total_deposit(&deps).unwrap()).unwrap();
     }
 
     #[test]
     fn test_query_past_results() {
         let mut deps = deposit_helper_function(0);
-        let env = mock_env("triggerer", &[Coin { denom: "uscrt".to_string(), amount: Uint128(600000000) }], 10, 700);
-        let res = claim_rewards(&mut deps, env).unwrap();
-        let env = mock_env("triggerer", &[Coin { denom: "uscrt".to_string(), amount: Uint128(600000000) }], 10, 1700);
-        let res = claim_rewards(&mut deps, env).unwrap();
-        let env = mock_env("triggerer", &[Coin { denom: "uscrt".to_string(), amount: Uint128(600000000) }], 10, 2700);
-        let res = claim_rewards(&mut deps, env);
-        let env = mock_env("triggerer", &[Coin { denom: "uscrt".to_string(), amount: Uint128(600000000) }], 10, 3700);
-        let res = claim_rewards(&mut deps, env);
-        let env = mock_env("triggerer", &[Coin { denom: "uscrt".to_string(), amount: Uint128(600000000) }], 10, 4700);
-        let res = claim_rewards(&mut deps, env);
-        let env = mock_env("triggerer", &[Coin { denom: "uscrt".to_string(), amount: Uint128(600000000) }], 10, 5700);
-        let res = claim_rewards(&mut deps, env);
-        let env = mock_env("triggerer", &[Coin { denom: "uscrt".to_string(), amount: Uint128(600000000) }], 10, 6700);
-        let res = claim_rewards(&mut deps, env);
-        let env = mock_env("triggerer", &[Coin { denom: "uscrt".to_string(), amount: Uint128(600000000) }], 10, 7700);
-        let res = claim_rewards(&mut deps, env);
+        let mut lottery_prefixed = ReadonlyPrefixedStorage::multilevel(&[LOTTERY_KEY_PREFIX], &deps.storage);
+        let lottery_store = TypedStore::<Lottery, ReadonlyPrefixedStorage<'_, MockStorage>>::attach(&mut lottery_prefixed);
+        let lottery = lottery_store.load(LOTTERY_KEY).unwrap();
 
-        let res: QueryAnswer = from_binary(&query_past_results(&deps).unwrap()).unwrap();
+
+        let _env = mock_env("triggerer", &[Coin { denom: "uscrt".to_string(), amount: Uint128(600000000) }], 10, lottery.end_time);
+        let lottery = lottery_store.load(LOTTERY_KEY).unwrap();
+        let _env = mock_env("triggerer", &[Coin { denom: "uscrt".to_string(), amount: Uint128(600000000) }], 10,lottery.end_time *2);
+        let lottery = lottery_store.load(LOTTERY_KEY).unwrap();
+        let _env = mock_env("triggerer", &[Coin { denom: "uscrt".to_string(), amount: Uint128(600000000) }], 10, lottery.end_time*3);
+        let lottery = lottery_store.load(LOTTERY_KEY).unwrap();
+        let _env = mock_env("triggerer", &[Coin { denom: "uscrt".to_string(), amount: Uint128(600000000) }], 10, lottery.end_time*4);
+        let lottery = lottery_store.load(LOTTERY_KEY).unwrap();
+        let _env = mock_env("triggerer", &[Coin { denom: "uscrt".to_string(), amount: Uint128(600000000) }], 10, lottery.end_time*5);
+        let lottery = lottery_store.load(LOTTERY_KEY).unwrap();
+        let _env = mock_env("triggerer", &[Coin { denom: "uscrt".to_string(), amount: Uint128(600000000) }], 10, lottery.end_time*6);
+        let lottery = lottery_store.load(LOTTERY_KEY).unwrap();
+        let _env = mock_env("triggerer", &[Coin { denom: "uscrt".to_string(), amount: Uint128(600000000) }], 10, lottery.end_time*7);
+        let lottery = lottery_store.load(LOTTERY_KEY).unwrap();
+        let env = mock_env("triggerer", &[Coin { denom: "uscrt".to_string(), amount: Uint128(600000000) }], 10, lottery.end_time*8);
+        let _res = claim_rewards(&mut deps, env);
+
+        let _res: QueryAnswer = from_binary(&query_past_records(&deps).unwrap()).unwrap();
     }
 
     // Query tests
     #[test]
     fn test_authenticated_queries() {
-        let (_init_result, mut deps) = init_helper(None);
-        let env = mock_env("sefi", &[], 601, 0);
+        let (_init_result, _deps) = init_helper(None);
+        let _env = mock_env("sefi", &[], 601, 0);
 
         let mut deps = deposit_helper_function(0);
 
@@ -1717,7 +1781,7 @@ mod tests {
             address: HumanAddr("Batman".to_string()),
             key: "no_vk_yet".to_string(),
         };
-        let query_result: QueryAnswer = from_binary(&query(&deps, no_vk_yet_query_msg).unwrap()).unwrap();
+        let _query_result: QueryAnswer = from_binary(&query(&deps, no_vk_yet_query_msg).unwrap()).unwrap();
         // println!("{:?}",query_result);
 
         let create_vk_msg = HandleMsg::CreateViewingKey {
@@ -1746,7 +1810,7 @@ mod tests {
             address: HumanAddr("Batman".to_string()),
             key: "wrong_vk".to_string(),
         };
-        let query_result: QueryAnswer = from_binary(&query(&deps, wrong_vk_query_msg).unwrap()).unwrap();
+        let _query_result: QueryAnswer = from_binary(&query(&deps, wrong_vk_query_msg).unwrap()).unwrap();
         // print!("{:?}",query_result);
     }
 
@@ -1755,10 +1819,8 @@ mod tests {
         //Contract balance > than
         let mut deps = deposit_helper_function(1000000000);
         let env = mock_env("Batman", &[], 0, 0);
-        trigger_withdraw(&mut deps, env.clone(), Uint128(300000000));
-        trigger_withdraw(&mut deps, env, Uint128(700000000));
-
-        let user = TypedStore::attach(&deps.storage).load("Batman".as_bytes()).unwrap_or(UserInfo { amount_delegated: Uint128(0), amount_available_for_withdraw: Default::default(), requested_withdraw: vec![], winning_history: vec![], total_won: Uint128(0) });
+        let _ = trigger_withdraw(&mut deps, env.clone(), Uint128(300000000));
+        let _ = trigger_withdraw(&mut deps, env, Uint128(700000000));
 
         let create_vk_msg = HandleMsg::CreateViewingKey {
             entropy: "heheeehe".to_string(),
@@ -1777,11 +1839,11 @@ mod tests {
         };
 
         let query_response = query(&deps, query_balance_msg).unwrap();
-        let balance = match from_binary(&query_response).unwrap() {
+        let _balance = match from_binary(&query_response).unwrap() {
             QueryAnswer::AvailableForWithdrawl { amount } => amount,
             _ => panic!("Unexpected result from query"),
         };
-        println!("The balance is {:?}", balance)
+        // println!("The balance is {:?}", balance)
     }
 
     #[test]
@@ -1791,8 +1853,6 @@ mod tests {
         let env = mock_env("triggerer", &[], 0, 6100);
         let _ = claim_rewards(&mut deps, env.clone());
         //  println!("The winner is {:?}",winner);
-
-        let user = TypedStore::attach(&deps.storage).load("Batman".as_bytes()).unwrap_or(UserInfo { amount_delegated: Uint128(0), amount_available_for_withdraw: Default::default(), requested_withdraw: vec![], winning_history: vec![], total_won: Uint128(0) });
 
         let create_vk_msg = HandleMsg::CreateViewingKey {
             entropy: "heheeehe".to_string(),
@@ -1810,14 +1870,14 @@ mod tests {
         };
 
         let query_response = query(&deps, query_balance_msg).unwrap();
-        let results: QueryAnswer = from_binary(&query_response).unwrap();
-        println!("The balance is {:?}", results);
+        let _results: QueryAnswer = from_binary(&query_response).unwrap();
+        // println!("The balance is {:?}", results);
 
         let query_balance_msg = QueryMsg::PastAllRecords {};
 
         let query_response = query(&deps, query_balance_msg).unwrap();
-        let results: QueryAnswer = from_binary(&query_response).unwrap();
-        println!("The balance is {:?}", results);
+        let _results: QueryAnswer = from_binary(&query_response).unwrap();
+        // println!("The balance is {:?}", results);
     }
 
     #[test]
@@ -1827,8 +1887,8 @@ mod tests {
 
         let env = mock_env("non-admin", &[], 600, 0);
         let mut config_prefixed = PrefixedStorage::multilevel(&[CONFIG_KEY_PREFIX], &mut deps.storage);
-        let mut configstore = TypedStoreMut::<Config, PrefixedStorage<'_, MockStorage>>::attach(&mut config_prefixed);
-        let mut config: Config = configstore.load(CONFIG_KEY).unwrap();
+        let configstore = TypedStoreMut::<Config, PrefixedStorage<'_, MockStorage>>::attach(&mut config_prefixed);
+        let config: Config = configstore.load(CONFIG_KEY).unwrap();
 
         let res = check_if_admin(&config, &env.message.sender).unwrap_err();
         assert_eq!(res, StdError::generic_err(
@@ -1837,23 +1897,23 @@ mod tests {
 
         let env = mock_env("admin", &[], 600, 0);
         let mut config_prefixed = PrefixedStorage::multilevel(&[CONFIG_KEY_PREFIX], &mut deps.storage);
-        let mut configstore = TypedStoreMut::<Config, PrefixedStorage<'_, MockStorage>>::attach(&mut config_prefixed);
-        let mut config: Config = configstore.load(CONFIG_KEY).unwrap();
+        let configstore = TypedStoreMut::<Config, PrefixedStorage<'_, MockStorage>>::attach(&mut config_prefixed);
+        let config: Config = configstore.load(CONFIG_KEY).unwrap();
 
         let res = check_if_admin(&config, &env.message.sender);
         assert_eq!(res, Ok(()));
 
         let env = mock_env("triggerer", &[], 600, 0);
         let mut config_prefixed = PrefixedStorage::multilevel(&[CONFIG_KEY_PREFIX], &mut deps.storage);
-        let mut configstore = TypedStoreMut::<Config, PrefixedStorage<'_, MockStorage>>::attach(&mut config_prefixed);
-        let mut config: Config = configstore.load(CONFIG_KEY).unwrap();
+        let configstore = TypedStoreMut::<Config, PrefixedStorage<'_, MockStorage>>::attach(&mut config_prefixed);
+        let config: Config = configstore.load(CONFIG_KEY).unwrap();
         let res = check_if_triggerer(&config, &env.message.sender);
         assert_eq!(res, Ok(()));
 
         let env = mock_env("non-triggerer", &[], 600, 0);
         let mut config_prefixed = PrefixedStorage::multilevel(&[CONFIG_KEY_PREFIX], &mut deps.storage);
-        let mut configstore = TypedStoreMut::<Config, PrefixedStorage<'_, MockStorage>>::attach(&mut config_prefixed);
-        let mut config: Config = configstore.load(CONFIG_KEY).unwrap();
+        let configstore = TypedStoreMut::<Config, PrefixedStorage<'_, MockStorage>>::attach(&mut config_prefixed);
+        let config: Config = configstore.load(CONFIG_KEY).unwrap();
         let res = check_if_triggerer(&config, &env.message.sender).unwrap_err();
         assert_eq!(res, StdError::generic_err(
             "This is an admin command. Admin commands can only be run from admin address",
@@ -1867,10 +1927,10 @@ mod tests {
         ));
 
         let env = mock_env("admin", &[], 600, 0);
-        let res = change_admin(&mut deps, env, HumanAddr("someone".to_string())).unwrap();
+        let _res = change_admin(&mut deps, env, HumanAddr("someone".to_string())).unwrap();
         let mut config_prefixed = PrefixedStorage::multilevel(&[CONFIG_KEY_PREFIX], &mut deps.storage);
-        let mut configstore = TypedStoreMut::<Config, PrefixedStorage<'_, MockStorage>>::attach(&mut config_prefixed);
-        let mut config: Config = configstore.load(CONFIG_KEY).unwrap();
+        let configstore = TypedStoreMut::<Config, PrefixedStorage<'_, MockStorage>>::attach(&mut config_prefixed);
+        let config: Config = configstore.load(CONFIG_KEY).unwrap();
         assert_eq!(config.admin, HumanAddr("someone".to_string()));
 
         let env = mock_env("not-admin", &[], 600, 0);
@@ -1880,10 +1940,10 @@ mod tests {
         ));
 
         let env = mock_env("someone", &[], 600, 0);
-        let res = change_triggerer(&mut deps, env, HumanAddr("someone".to_string())).unwrap();
+        let _res = change_triggerer(&mut deps, env, HumanAddr("someone".to_string())).unwrap();
         let mut config_prefixed = PrefixedStorage::multilevel(&[CONFIG_KEY_PREFIX], &mut deps.storage);
-        let mut configstore = TypedStoreMut::<Config, PrefixedStorage<'_, MockStorage>>::attach(&mut config_prefixed);
-        let mut config: Config = configstore.load(CONFIG_KEY).unwrap();
+        let configstore = TypedStoreMut::<Config, PrefixedStorage<'_, MockStorage>>::attach(&mut config_prefixed);
+        let config: Config = configstore.load(CONFIG_KEY).unwrap();
 
         assert_eq!(config.triggerer, HumanAddr("someone".to_string()));
     }
@@ -1896,7 +1956,7 @@ mod tests {
         let env = mock_env("admin", &[], 600, 0);
 
         let handle_msg = HandleMsg::SetStopAllStatus {};
-        let res = handle(&mut deps, env.clone(), handle_msg);
+        let _res = handle(&mut deps, env.clone(), handle_msg);
 
         let handle_msg = HandleMsg::TriggerWithdraw { amount: Uint128(500000000), padding: None };
         let res = handle(&mut deps, env.clone(), handle_msg);
@@ -1906,38 +1966,16 @@ mod tests {
         ));
 
         let handle_msg = HandleMsg::SetStopAllButWithdrawStatus {};
-        let res = handle(&mut deps, env.clone(), handle_msg);
+        let _res = handle(&mut deps, env.clone(), handle_msg);
 
         let env = mock_env("Batman", &[], 600, 0);
 
         let handle_msg = HandleMsg::TriggerWithdraw { amount: Uint128(500000000), padding: None };
-        let res = handle(&mut deps, env, handle_msg);
+        let _res = handle(&mut deps, env, handle_msg);
 
         let env = mock_env("admin", &[], 600, 0);
         let handle_msg = HandleMsg::SetStopAllStatus {};
-        let res = handle(&mut deps, env.clone(), handle_msg);
-    }
-
-    #[test]
-    fn testing123() {
-        let mut deps = deposit_helper_function(1000000000);
-        let mut winning_amount = Uint128(1002000);
-
-        let mut config_prefixed = PrefixedStorage::multilevel(&[CONFIG_KEY_PREFIX], &mut deps.storage);
-        let mut configstore = TypedStoreMut::<Config, PrefixedStorage<'_, MockStorage>>::attach(&mut config_prefixed);
-        let mut config: Config = configstore.load(CONFIG_KEY).unwrap();
-        let triggerpercentage = config.triggerer_share_percentage;
-
-        let triggershare = Uint128(winning_amount.0 * ((triggerpercentage * 1000000) as u128) / 100000000);
-        println!("{:?}", triggershare);
-
-        // println!("{:?}",(triggerpercentage*1000000.0) as u128);
-        // println!("{:?}",winning_amount.0*((triggerpercentage*1000000.0) as u128)/1000000000);
-
-        winning_amount = (winning_amount - triggershare).unwrap();
-
-        println!("{:?}", winning_amount);
-        println!("{:?}", winning_amount.0 as u64);
+        let _res = handle(&mut deps, env.clone(), handle_msg);
     }
 
     #[test]
@@ -1948,11 +1986,7 @@ mod tests {
         let _ = try_deposit(&mut deps, mock_env("Batman", &[Coin { denom: "uscrt".to_string(), amount: Uint128(400000000) }], 10, 300));
 
 
-        let mut lottery_prefixed = ReadonlyPrefixedStorage::multilevel(&[LOTTERY_KEY_PREFIX], & deps.storage);
-        let mut lottery_store = TypedStore::<Lottery, ReadonlyPrefixedStorage<'_, MockStorage>>::attach(&mut lottery_prefixed);
-        let mut a_lottery= lottery_store.load(LOTTERY_KEY).unwrap();
         //Computing weights for the lottery
-        let _lottery_entries: Vec<_> = (&a_lottery.entries).into_iter().map(|(address, _, _)| address).collect();
 
         let mut config_prefixed = PrefixedStorage::multilevel(&[CONFIG_KEY_PREFIX], &mut deps.storage);
         let mut configstore = TypedStoreMut::<Config, PrefixedStorage<'_, MockStorage>>::attach(&mut config_prefixed);
@@ -1965,15 +1999,18 @@ mod tests {
             padding: None,
         };
 
-        let res = handle(&mut deps, mock_env("admin", &[], 10, 0), handlemsg);
+        let _res = handle(&mut deps, mock_env("admin", &[], 10, 0), handlemsg);
         let mut config_prefixed = PrefixedStorage::multilevel(&[CONFIG_KEY_PREFIX], &mut deps.storage);
-        let mut configstore = TypedStoreMut::<Config, PrefixedStorage<'_, MockStorage>>::attach(&mut config_prefixed);
-        let mut config: Config = configstore.load(CONFIG_KEY).unwrap();
+        let configstore = TypedStoreMut::<Config, PrefixedStorage<'_, MockStorage>>::attach(&mut config_prefixed);
+        let config: Config = configstore.load(CONFIG_KEY).unwrap();
         let _response = claim_rewards(&mut deps, mock_env("triggerer", &[], 10, config.unbonding_time)).unwrap();
 
-        let user = TypedStore::attach(&deps.storage).load("Batman".as_bytes()).unwrap_or(UserInfo { amount_delegated: Uint128(0), amount_available_for_withdraw: Default::default(), requested_withdraw: vec![], winning_history: vec![], total_won: Uint128(0) });
-        assert_eq!(user.amount_available_for_withdraw.0, 990000);
-        assert_eq!(user.requested_withdraw.len(), 0);
+        let  user_prefixed = ReadonlyPrefixedStorage::multilevel(&[USER_INFO_KEY, "Batman".as_bytes()], & deps.storage);
+        let  user_store = TypedStore::<UserInfo, ReadonlyPrefixedStorage<'_, MockStorage>>::attach(& user_prefixed);
+        let  user =
+            user_store.load("Batman".as_bytes())
+                .unwrap_or(UserInfo { amount_delegated: Uint128(0), amount_available_for_withdraw: Uint128(0), requested_withdraw: vec![], total_won: Uint128(0), entry_index: vec![] }); // NotFound is the only possible error
+    assert_eq!(user.requested_withdraw.len(), 0);
         assert_eq!(user.amount_delegated.0, 1000000000);
     }
 
@@ -1984,21 +2021,17 @@ mod tests {
         let _ = try_deposit(&mut deps, mock_env("Batman", &[Coin { denom: "uscrt".to_string(), amount: Uint128(600000000) }], 10, 0));
         let _ = try_deposit(&mut deps, mock_env("Batman", &[Coin { denom: "uscrt".to_string(), amount: Uint128(400000000) }], 10, 300));
 
-        let mut lottery_prefixed = ReadonlyPrefixedStorage::multilevel(&[LOTTERY_KEY_PREFIX], & deps.storage);
-        let mut lottery_store = TypedStore::<Lottery, ReadonlyPrefixedStorage<'_, MockStorage>>::attach(&mut lottery_prefixed);
-        let mut a_lottery= lottery_store.load(LOTTERY_KEY).unwrap();
         //Computing weights for the lottery
-        let _lottery_entries: Vec<_> = (&a_lottery.entries).into_iter().map(|(address, _, _)| address).collect();
         let mut config_prefixed = PrefixedStorage::multilevel(&[CONFIG_KEY_PREFIX], &mut deps.storage);
-        let mut configstore = TypedStoreMut::<Config, PrefixedStorage<'_, MockStorage>>::attach(&mut config_prefixed);
-        let mut config: Config = configstore.load(CONFIG_KEY).unwrap();
+        let configstore = TypedStoreMut::<Config, PrefixedStorage<'_, MockStorage>>::attach(&mut config_prefixed);
+        let config: Config = configstore.load(CONFIG_KEY).unwrap();
         let _response = claim_rewards(&mut deps, mock_env("triggerer", &[], 10, config.unbonding_time,
         )).unwrap();
         let handlemsg = HandleMsg::TriggeringCostWithdraw {};
-        let res = handle(&mut deps, mock_env("triggerer", &[], 10, 0), handlemsg);
+        let _res = handle(&mut deps, mock_env("triggerer", &[], 10, 0), handlemsg);
 
-        let mut supply_pool_prefixed = ReadonlyPrefixedStorage::multilevel(&[SUPPLY_POOL_KEY_PREFIX], & deps.storage);
-        let mut supply_store = TypedStore::<SupplyPool, ReadonlyPrefixedStorage<'_, MockStorage>>::attach(& supply_pool_prefixed);
+        let supply_pool_prefixed = ReadonlyPrefixedStorage::multilevel(&[SUPPLY_POOL_KEY_PREFIX], &deps.storage);
+        let supply_store = TypedStore::<SupplyPool, ReadonlyPrefixedStorage<'_, MockStorage>>::attach(&supply_pool_prefixed);
         let supply_pool = supply_store.load(SUPPLY_POOL_KEY).unwrap();
         assert_eq!(supply_pool.triggerer_share, Uint128(0));
     }
@@ -2011,20 +2044,12 @@ mod tests {
         let _ = try_deposit(&mut deps, mock_env("Batman", &[Coin { denom: "uscrt".to_string(), amount: Uint128(400000000) }], 10, 300));
 
         let handlemsg = HandleMsg::ChangeLotteryDuration { duration: 100 };
-        let res = handle(&mut deps, mock_env("admin", &[], 10, 0), handlemsg);
+        let _res = handle(&mut deps, mock_env("admin", &[], 10, 0), handlemsg);
 
-        let mut lottery_prefixed = ReadonlyPrefixedStorage::multilevel(&[LOTTERY_KEY_PREFIX], & deps.storage);
-        let mut lottery_store = TypedStore::<Lottery, ReadonlyPrefixedStorage<'_, MockStorage>>::attach(&mut lottery_prefixed);
-        let mut a_lottery= lottery_store.load(LOTTERY_KEY).unwrap();
+        let mut lottery_prefixed = ReadonlyPrefixedStorage::multilevel(&[LOTTERY_KEY_PREFIX], &deps.storage);
+        let lottery_store = TypedStore::<Lottery, ReadonlyPrefixedStorage<'_, MockStorage>>::attach(&mut lottery_prefixed);
+        let a_lottery = lottery_store.load(LOTTERY_KEY).unwrap();
         assert_eq!(a_lottery.duration, 100);
 
-        let _response = claim_rewards(&mut deps, mock_env("triggerer", &[], 611, 611)).unwrap();
-        let mut lottery_prefixed = ReadonlyPrefixedStorage::multilevel(&[LOTTERY_KEY_PREFIX], & deps.storage);
-        let mut lottery_store = TypedStore::<Lottery, ReadonlyPrefixedStorage<'_, MockStorage>>::attach(&mut lottery_prefixed);
-        let mut a_lottery= lottery_store.load(LOTTERY_KEY).unwrap();
-        assert_eq!(a_lottery.start_time, 621);
-        assert_eq!(a_lottery.end_time, 721);
-
-        //
     }
 }
